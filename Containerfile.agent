@@ -7,7 +7,7 @@ COPY . .
 ARG GIT_COMMIT=dev
 ARG BUILD_TIME=unknown
 RUN CGO_ENABLED=0 go build \
-    -ldflags="-X github.com/codeready-toolchain/cli-mcp-server/pkg/version.commitOverride=${GIT_COMMIT} -X github.com/codeready-toolchain/cli-mcp-server/pkg/version.BuildTime=${BUILD_TIME}" \
+    -ldflags="-X github.com/codeready-toolchain/cli-mcp-operator/pkg/version.commitOverride=${GIT_COMMIT} -X github.com/codeready-toolchain/cli-mcp-operator/pkg/version.BuildTime=${BUILD_TIME}" \
     -o bin/sandbox-agent ./cmd/agent/
 
 FROM quay.io/codeready-toolchain/oc-client-base-minimal:latest

@@ -13,7 +13,7 @@ We are converting CLI MCP into an operator, then adding proxy children later. La
 
 ### Option A: Same git repo, rename to `cli-mcp-operator`, multiple images
 
-GitHub rename `cli-mcp-server` → `cli-mcp-operator` (issues/PRs/redirects kept). Go module path follows: `github.com/codeready-toolchain/cli-mcp-operator`. Add `cmd/operator` + `api/v1alpha1` beside existing `cmd/server` and `cmd/agent`. Separate images: `cli-mcp-operator`, `cli-mcp-server`, `cli-mcp-sandbox`, later `cli-mcp-proxy`. Image names do not have to match the repo (claw-operator already ships `claw-proxy`). Server must not import `internal/controller`.
+GitHub rename `cli-mcp-server` → `cli-mcp-operator` is **done** (issues/PRs/redirects kept). Go module is `github.com/codeready-toolchain/cli-mcp-operator`. Add `cmd/operator` + `api/v1alpha1` beside existing `cmd/server` and `cmd/agent`. Separate images: `cli-mcp-operator`, `cli-mcp-server`, `cli-mcp-sandbox`, later `cli-mcp-proxy`. Image names do not have to match the repo (claw-operator already ships `claw-proxy`). Server must not import `internal/controller`.
 
 - **Pro:** One PR surface for CRD + flag changes + later proxy. Matches claw-operator. No GitOps consumer yet, so rename is cheap. History stays one timeline.
 - **Con:** `go.mod` gains controller-runtime/envtest (server binary still won’t link them if imports stay clean). One-time import-path churn. `pkg/session` lives under an `-operator` module (same as claw’s `internal/proxy`).

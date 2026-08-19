@@ -331,7 +331,7 @@ Operator Deployment env (`config/manager`): `RELATED_IMAGE_SERVER`, `RELATED_IMA
 
 ### Make targets
 
-Replace the current Makefile with the Kubebuilder/claw Makefile, then **extend** it. Today `make build` means server+agent; after this it must still compile every binary CI cares about. Port `make/git.mk` `GIT_COMMIT_ID` / `BUILD_TIME` into operator+server+agent ldflags (Containerfiles today bake `github.com/codeready-toolchain/cli-mcp-server/pkg/version` — update that path in Phase 2). Do **not** copy claw’s `go test … -coverpkg=./internal/...` — this module’s tests live in `pkg/` as well as `internal/`.
+Replace the current Makefile with the Kubebuilder/claw Makefile, then **extend** it. Today `make build` means server+agent; after this it must still compile every binary CI cares about. Port `make/git.mk` `GIT_COMMIT_ID` / `BUILD_TIME` into operator+server+agent ldflags (Containerfiles bake `github.com/codeready-toolchain/cli-mcp-operator/pkg/version`). Do **not** copy claw’s `go test … -coverpkg=./internal/...` — this module’s tests live in `pkg/` as well as `internal/`.
 
 Today `make run` is `go run ./cmd/server`. After Phase 2, Kubebuilder `make run` is the **operator**. Keep `make run-server` / `run-agent` so the data plane is still one target away.
 
@@ -431,25 +431,23 @@ Per-phase **Test tips** below are hints for the implementer, not an exhaustive s
 
 Walked [cli-mcp-operator-questions.md](cli-mcp-operator-questions.md). This document is Final.
 
-### Phase 1 — GitHub rename — **no PR**
+### Phase 1 — GitHub rename — **done**
 
-Rename the GitHub repo `cli-mcp-server` → `cli-mcp-operator` (settings; issues/PRs/redirects kept). No code change in this phase. Phase 2’s first commit sets the Go module path to match.
-
-- **Verify:** repo URL is `codeready-toolchain/cli-mcp-operator`; old URL redirects.
+GitHub repo is `codeready-toolchain/cli-mcp-operator` (old URL redirects). Go module is `github.com/codeready-toolchain/cli-mcp-operator`. No further work here.
 
 ### Phase 2 — Scaffold the operator repo — **PR**
 
-Follow [Repository layout](#repository-layout-target). **No reconciler product logic** (stub from `create api` only). **MCP behavior stays as-built** except import-path churn from the module rename.
+Follow [Repository layout](#repository-layout-target). **No reconciler product logic** (stub from `create api` only). **MCP behavior stays as-built**.
 
-- Module path `github.com/codeready-toolchain/cli-mcp-operator`; fix imports.
+- Module path is already `github.com/codeready-toolchain/cli-mcp-operator`.
 - `operator-sdk init` + `create api` in a throwaway dir; merge `PROJECT`, `config/`, `hack/`, Kubebuilder Makefile. Move `cmd/main.go` → `cmd/operator/main.go`; `go build -o bin/manager ./cmd/operator`.
 - Replace the current Makefile; port `build-server` / `build-agent` / image targets **and** `make/git.mk` ldflags. `make build` compiles manager + server + agent. `make run` is the operator; add `run-server` / `run-agent`. `LOCALBIN`: controller-gen, kustomize, setup-envtest, operator-sdk, opm.
-- `Containerfile.operator`; operator image COPYs `pkg/`. Tighten server/agent Containerfiles (no `internal/` / `api/`). Update ldflags module path in both existing Containerfiles.
+- `Containerfile.operator`; operator image COPYs `pkg/`. Tighten server/agent Containerfiles (no `internal/` / `api/`). Ldflags already use the `cli-mcp-operator` module path.
 - `config/manager`: `RELATED_IMAGE_*`. No claw operator-config `WATCH_NAMESPACE`.
 - **OLM artifacts, not catalog CD:** CSV base, `make bundle` with `REPLACE_*` relatedImages, `bundle.Dockerfile`. Copy claw overlay/`opm` **Makefile** patterns. Do **not** turn on master catalog publish yet (that would ship a no-op operator).
 - **CI/CD:** keep the required check job id `build-test-coverage`. Add the operator image to the CI build matrix. Quay push of `cli-mcp-operator` on master may start here (image only). Catalog publish waits for Phase 4. `make test` must still run `pkg/` tests (do not copy claw `coverpkg=./internal/...`).
 - envtest wired (`make test`); empty reconciler is enough.
-- **Test tips:** keep existing MCP tests green after the module rename. Kind e2e harness may be stubbed (claw-style `test/e2e`); no instance to assert yet.
+- **Test tips:** keep existing MCP tests green. Kind e2e harness may be stubbed (claw-style `test/e2e`); no instance to assert yet.
 - **Done when:** `make generate` / `manifests` clean; `make build` → `bin/manager` + server + agent; `go build ./cmd/server` does not type-check `internal/controller`; operator image builds; `make bundle` validates; `make deploy` works without OLM; `make run-server` still runs the MCP.
 - **Coverage check:** [Testing](#testing-all-code-phases) against this PR’s diff.
 - **Out of this PR:** CR field logic, HMAC, children, pool, MCP label/flag changes, GitHub CD catalog push.

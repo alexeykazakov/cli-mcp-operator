@@ -1,4 +1,4 @@
-# cli-mcp-server
+# cli-mcp-operator
 
 MCP server that gives AI agents a **sandboxed bash shell** inside per-session Kubernetes pods.
 
@@ -136,7 +136,7 @@ make build-prod     # Production build (static, CGO disabled)
 ```
 
 ```
-cli-mcp-server/
+cli-mcp-operator/
 ├── cmd/server/     # MCP server entry point
 ├── cmd/agent/      # Sandbox agent entry point
 ├── pkg/session/    # Pod lifecycle, warm pool, cache

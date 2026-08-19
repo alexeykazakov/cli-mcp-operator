@@ -1,4 +1,4 @@
-module github.com/codeready-toolchain/cli-mcp-server
+module github.com/codeready-toolchain/cli-mcp-operator
 
 go 1.26.0
 
