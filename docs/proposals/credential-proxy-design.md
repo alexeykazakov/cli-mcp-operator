@@ -400,9 +400,11 @@ MCP Role: `get` on `endpoints` (core) and `networkpolicies` (`networking.k8s.io`
 
 ## Implementation Plan
 
-Do not execute the old MCP-ensure-loop phases. This is a **new** plan for proxy children on the existing operator. The MCP is not in production; the cutover PR **will** break in-cluster `oc` that relied on a real kubeconfig mount — that is the point. Local `cmd/server` without proxy flags keeps the old mount.
+Do not execute the old MCP-ensure-loop phases. This is a **new** plan for proxy children on the existing operator. Nothing is deployed. An intermediate PR may break the previous PR’s sandbox mount, flags, or `oc`. Do not add a compatibility path so an older in-cluster layout keeps working, and do not write a retrofit for sessions that existed before the proxy. The only supported in-cluster state is the completed last phase (PR 3).
 
-**Assigned pods at cutover are not retrofitted.** They keep the admin Secret mount and no `HTTPS_PROXY` until idle-GC / `DELETE`. Adding sandbox Egress then blocks their direct API (they also cannot use the proxy without env). Do not roll this onto a live first-party instance that still has sessions. Unassigned pool pods hash-rebuild onto dummy + proxy env.
+Q11 still applies once that proxy exists: a later CR edit must not drain running sessions. That is runtime behavior of the finished system, not a promise that PR 1’s pods survive PR 2.
+
+Local `cmd/server` without proxy flags still mounts `--kubeconfig-secret` and skips the NP gate. That mode is for tests and local dev of the finished binary, not a second in-cluster layout.
 
 A **phase is a milestone**. Code phases: exactly one PR. Do not merge the proxy binary with the operator cutover (different review). Do not split labels / flags / NPs into tiny PRs.
 
@@ -418,7 +420,7 @@ Walked [credential-proxy-questions.md](credential-proxy-questions.md). This docu
 
 ### PR 1 — Proxy binary in this repo
 
-Additive. Operator and sandboxes unchanged (still mount the real Secret).
+This PR does not touch the operator or sandbox mounts (they still mount the real Secret). That is scope, not a compatibility promise: PR 2 may break that mount.
 
 - `cmd/proxy` + `pkg/proxy` + `pkg/kubeconfig`: MITM CONNECT **and** plaintext HTTP `OnRequest`, route JSON with exact `host:port`, strip-then-inject, kubernetes injector, `none` for allowlist (**always MITM**, never claw’s direct tunnel), Q9 denylist on kubernetes routes, Q8 literal match, upstream TLS verify, token-only validate, sanitize dummy kubeconfig. **Inspired by claw; do not vendor `claw-operator/internal/proxy`.** No `bearer`, gateway, Slack, GCP, oauth2, suffix-domain match, `AllowedPaths` allowlist.
 - Unit tests: route match (host:port only; bare host must not match another port; suffix/wildcard rejected), unknown host CONNECT rejected (including raw IPs unless the route is an IP), plaintext HTTP to an unknown host 403, Authorization stripped and replaced, token-only rejection matrix, sanitize swaps CA + dummy token, denylist vs `logs`/`watch`, `none` MITMs (CONNECT is not a raw tunnel).
