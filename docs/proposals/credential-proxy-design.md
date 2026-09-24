@@ -216,6 +216,7 @@ Sandbox NP name stays `cli-mcp-<name>-sandbox` (add Egress). Proxy NP name is `c
 Same idea as claw `parseAndValidateKubeconfig` + `sanitizeKubeconfig` (implement here; do not import claw):
 
 - Parse: token-only. Reject client certs, exec, auth-provider, basic auth, `tokenFile`, `certificate-authority` *file* paths (inline `certificate-authority-data` only).
+- One token per server `host:port`. Contexts that share a server may differ by namespace. Different tokens for that same server → `KubeconfigInvalid` (do not last-write-wins, do not pick `current-context`). Different servers keep different tokens.
 - Preserve clusters (real `server` URLs), contexts, namespaces.
 - Replace every user token with `proxy-managed-token`. Clear `tokenFile`.
 - Set each cluster’s `certificate-authority-data` to the **proxy CA** (not the real API CA). Clear `insecure-skip-tls-verify`.
@@ -308,7 +309,7 @@ Overlay hash (today: image / resources / user env only) must also fingerprint du
 
 ### Proxy configuration
 
-Route list JSON. Kubernetes target: one route per kubeconfig cluster `server` (all clusters, not only `current-context`; CONNECT key is URL host:port, not path). Allowlist target: one route per domain, `injector: none`. Operator always emits `domain` as `host:port`.
+Route list JSON. Kubernetes target: one route per kubeconfig cluster `server` (all clusters, not only `current-context`; CONNECT key is URL host:port, not path). That route injects the single token for that `host:port`. `CONNECT` has no context, and the sandbox token is always `proxy-managed-token`, so the proxy does not select a per-user credential. Allowlist target: one route per domain, `injector: none`. Operator always emits `domain` as `host:port`.
 
 ```json
 {
