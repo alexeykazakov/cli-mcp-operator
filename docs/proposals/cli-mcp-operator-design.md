@@ -4,7 +4,7 @@
 
 **Related:** [cli-mcp-operator-questions.md](cli-mcp-operator-questions.md) · [As-built design](../design.md) · [Credential proxy WHAT](credential-proxy-design.md) · [Umbrella proxy analysis](../../../docs/proposals/cli-mcp-credential-proxy.md)
 
-This document is the **HOW** for instance infrastructure: a Kubernetes operator that owns one MCP instance per CR. It is **not** the proxy design. This phase is for **building and testing** that operator (bash + session pods + investigation kubeconfig still mounted so `oc` works). Nothing is in production; the MCP is not used until the proxy exists. The next design pass adds proxy children to the same operator.
+This document is the **HOW** for instance infrastructure: a Kubernetes operator that owns one MCP instance per CR. It is **not** the proxy design. The operator (through client auth) is implemented; bash + session pods still mount the investigation kubeconfig so `oc` works. Nothing is in production; the MCP is not used until the proxy exists. The proxy pass is [credential-proxy-design.md](credential-proxy-design.md) (Final) — same CR, new children. Proxy Q1 decided `spec.proxy.targets[]` (optional kubernetes `secretName`; operator Gets the Secret, does not mint it).
 
 This is an **open-source Kubernetes operator**. Docs describe the product any cluster can install. First-party internal deploy is one consumer of the OLM catalog, not part of the operator API.
 
@@ -16,7 +16,7 @@ CLI MCP is a stateless, multi-replica MCP server (`cmd/server`) that creates per
 
 1. Convert today’s MCP into an operator-managed instance (same bash/session contract).
 2. Implement and deploy that (no proxy components).
-3. Return to the proxy design and add proxy children to this operator.
+3. Proxy pass: [credential-proxy-design.md](credential-proxy-design.md) — same operator, new children.
 
 ```
 Cluster admin                         Cluster
@@ -48,8 +48,8 @@ An MCP client calls `/mcp` with `X-Session-ID` and `DELETE /sessions/{id}`. That
 1. **Operator is the singleton; MCP is the data plane.** Leader-elected controller. MCP replicas stay stateless and horizontally scaled. Sessions are **not** CRs.
 2. **MCP does not reconcile infrastructure, pool, or idle GC.** No Deployment/NP/CA ensure-loop in `cmd/server`. The server claims or creates session pods on the bash hot path and deletes on `DELETE /sessions/{id}` only.
 3. **Testable bash contract before proxy.** One tool, HMAC `/exec`, real investigation kubeconfig mounted so operator tests can run `oc`. Isolation (dummy kubeconfig, egress lock) is the next design. Warm pool and idle GC move to the operator (Q5).
-4. **CR + labels + ownership must be proxy-ready.** Instance identity, ownerRefs, and “admin provides investigation kubeconfig” are the extension points. Do **not** implement proxy children here, and do **not** freeze a `spec.proxy` API before that design.
-5. **Operator does not mint investigation tokens or MCP client tokens.** The kubeconfig Secret is provided (GitOps, External Secrets, or `kubectl`) under the conventional name `cli-mcp-<name>-kubeconfig`. The operator does not put a secret ref on the CR (same as TLS). HMAC is an internal MCP↔agent shared secret: the operator **generate-once**s it (same pattern as the later proxy CA). The operator does not rotate HMAC on reconcile. The MCP client SA is operator-owned; the admin mints a TokenRequest against `status.clientServiceAccount`.
+4. **CR + labels + ownership must be proxy-ready.** Instance identity, ownerRefs, and “admin provides investigation kubeconfig” are the extension points. Proxy children and `spec.proxy.targets` are specified in [credential-proxy-design.md](credential-proxy-design.md) (Final) — this HOW does not re-specify them.
+5. **Operator does not mint investigation tokens or MCP client tokens.** The kubeconfig Secret is provided (GitOps, External Secrets, or `kubectl`) under the conventional name `cli-mcp-<name>-kubeconfig`, or a kubernetes target’s optional `secretName` (proxy Q1). The operator does not mint tokens or `ownerRef` that Secret. HMAC is an internal MCP↔agent shared secret: the operator **generate-once**s it (same pattern as the later proxy CA). The operator does not rotate HMAC on reconcile. The MCP client SA is operator-owned; the admin mints a TokenRequest against `status.clientServiceAccount`.
 6. **`cmd/server` remains runnable without the operator.** Local stdio, unit tests, and `go run ./cmd/server` stay flag-driven. After Phase 3 that means claim + on-demand create only — not pool replenish or idle GC (operator: idle GC in Phase 4, pool in Phase 5).
 7. **Fail closed on instance delete.** Removing the CR must not leave sandbox pods as unlabeled orphans forever.
 8. **Portable Kubernetes, optional OpenShift.** The operator must install and reconcile on generic Kubernetes. OpenShift-only behavior (serving-cert annotation, SCCs) is detected or left to the admin, not required. (Q2)
@@ -206,11 +206,11 @@ Do **not** grant `climcpinstances` (no subresource) to the client SA. Do **not**
 
 No bearer token on status. No operator-created `kubernetes.io/service-account-token` Secret.
 
-**Secret RBAC:** HMAC is a file mount; investigation kubeconfig is a sandbox volume — MCP must not get/list/watch Secrets. Session Secret **create/delete** is namespace-wide (RBAC cannot prefix-limit `cli-mcp-sandbox-auth-*`). Operator `manager-role` keeps namespaced secrets get/list/watch/create/update/patch/delete (HMAC, Ready keys, idle GC/finalizer). That SA is the OperatorGroup target-namespace **secret trust boundary**; do not co-locate unrelated tenant Secrets. Do not `ownerRef` or delete admin kubeconfig/TLS.
+**Secret RBAC:** HMAC is a file mount; investigation kubeconfig is a sandbox volume — MCP must not get/list/watch Secrets. Session Secret **create/delete** is namespace-wide (RBAC cannot prefix-limit `cli-mcp-sandbox-auth-*`). Operator **`manager-namespaced-role`** has namespaced secrets get/list/watch/create/update/patch/delete (HMAC, Ready keys, idle GC/finalizer). ClusterRole `manager-role` is CRs + auth-delegator CRB only. That SA is the OperatorGroup target-namespace **secret trust boundary**; do not co-locate unrelated tenant Secrets. Do not `ownerRef` or delete admin kubeconfig/TLS.
 
 TLS for kube-rbac-proxy: mount Secret `cli-mcp-<name>-tls`. On OpenShift the operator sets the Service serving-cert annotation (platform creates the Secret). On generic Kubernetes the **admin** creates that Secret. The operator does not generate certs and does not `ownerRef` this Secret.
 
-Investigation kubeconfig: admin creates Secret `cli-mcp-<name>-kubeconfig` (key `kubeconfig`). This phase it is mounted on sandbox pods. No spec field, no `ownerRef` (same as TLS). Proxy pass unmounts it from the sandbox and mounts it on the proxy.
+Investigation kubeconfig: admin creates Secret `cli-mcp-<name>-kubeconfig` (key `kubeconfig`) unless a kubernetes target sets `secretName`. This phase it is mounted on sandbox pods. No `ownerRef` (same as TLS). Proxy pass unmounts it from the sandbox and mounts it on the proxy.
 
 All operator-owned **namespaced** objects get `ownerRef` → the CR and instance labels. Pool pods the operator creates get `ownerRef`; MCP on-demand session pods do not. ClusterRoleBinding `cli-mcp-auth-delegator` does **not** get an instance `ownerRef`.
 
@@ -253,7 +253,7 @@ Flags the operator sets (existing + small additions):
 | `--hmac-key-file` | mount of operator-generated Secret `cli-mcp-<name>-hmac` (file is the `key` entry) |
 | `--idle-timeout`, `--warm-pool-size` | **not** passed in-cluster — `spec.sandbox` is operator-only (Q5, Q6, Q9). After Phase 3 they must **not** start MCP replenish or idle GC (no dual path). Keep the flags so old CLIs still parse if useful; they have no in-cluster effect. |
 | `--instance-name` | **new** — CR `metadata.name` (labels). Required; no default. |
-| `--kubeconfig-secret` | **new** — always `cli-mcp-<name>-kubeconfig` (not a spec field; not `--kubeconfig`). Required; no default. |
+| `--kubeconfig-secret` | **new** — always `cli-mcp-<name>-kubeconfig` (not a spec field; not `--kubeconfig`). Required; no default. **Proxy pass:** not passed in-cluster; real Secret is not a sandbox mount. |
 | `--sandbox-service-account` | **new** — operator-owned `cli-mcp-<name>-sandbox` (not a spec field). Required; do **not** default to `cli-mcp-investigation-sa` (Q12). |
 | `--sandbox-cpu-request`, `--sandbox-cpu-limit`, `--sandbox-memory-request`, `--sandbox-memory-limit` | **new** — `spec.sandbox.resources`. Empty/omitted → DefaultConfig `100m`/`500m`/`128Mi`/`512Mi`. |
 | `--sandbox-image-pull-policy` | **new** — `spec.sandbox.imagePullPolicy`. |
@@ -271,7 +271,7 @@ Images (Q7, Q16): OLM `relatedImages` → `RELATED_IMAGE_SERVER` / `RELATED_IMAG
 
 **Shared pod spec:** operator pool pods and MCP on-demand pods must call the same builder in `pkg/session` (export today’s `buildBasePodSpec`). The builder takes operator-owned base (SA, automount false, instance/component labels, probes, kubeconfig mount this phase, today’s non-root / drop-caps security context) plus the class overlay from `SandboxConfig` (image, resources, env, imagePullPolicy). Session token env (`SANDBOX_AUTH_TOKEN`) is **assigned / on-demand only**; unassigned pool pods get the token via `POST /assign`, not that env. The operator image may import `pkg/session`. `cmd/server` must not import `internal/controller`. `pkg/session` must not import `api/`. Empty `spec.sandbox.resources` → **today’s DefaultConfig requests/limits**, not BestEffort. Pool recreate hash includes the overlay, not only the image tag. A CR `securityContext` / extra volume field is later (do not stub); the builder still ships today’s pod security context now.
 
-**Investigation kubeconfig Secret** is admin-provided, name `cli-mcp-<name>-kubeconfig`, key `kubeconfig` (as-built: `KUBECONFIG=/config/kubeconfig`). Same convention as TLS (`cli-mcp-<name>-tls`): no spec field, no `ownerRef`. This phase the operator **mounts it on sandbox pods** so tests can run `oc`. Ready requires that key present and non-empty (`SecretKeysInvalid` if not); it does not parse the kubeconfig. Proxy pass: **unmount from sandbox**, keep the Secret, mount it on the proxy, derive dummy + routes. Do not delete the Secret when the proxy lands.
+**Investigation kubeconfig Secret** is admin-provided, default name `cli-mcp-<name>-kubeconfig`, key `kubeconfig` (as-built: `KUBECONFIG=/config/kubeconfig`). Same convention as TLS (`cli-mcp-<name>-tls`): no `ownerRef`. This phase the operator **mounts it on sandbox pods** so tests can run `oc`. Ready requires that key present and non-empty (`SecretKeysInvalid` if not); it does not parse the kubeconfig. Proxy pass: **unmount from sandbox**, keep the Secret (default name or kubernetes `secretName`), mount it on the proxy, derive dummy + routes. Do not delete the Secret when the proxy lands.
 
 **HMAC Secret:** operator creates `cli-mcp-<name>-hmac` if missing (random bytes, key `key`), `ownerRef` → CR, mounts into every MCP replica. Do not overwrite an existing Secret (generate-once). Do not rotate on reconcile — that would invalidate live session tokens. If the Secret is deleted, the operator recreates it and must roll the MCP Deployment (stamp the Secret hash/resourceVersion on the pod template). If it exists but `key` is missing or empty, Ready is `SecretKeysInvalid` (do not fill it in). Local `cmd/server` still uses `--hmac-key-file`. No `spec.hmacKeySecretRef`. ConfigMap `cli-mcp-<name>-krp` uses the same stamp-on-pod-template pattern so kube-rbac-proxy picks up ResourceAttributes edits.
 
@@ -312,11 +312,11 @@ Q12: operator creates a dedicated sandbox SA (`cli-mcp-<name>-sandbox`) with **n
 
 Dummy kubeconfig is proxy work — without a proxy it would make `oc` fail and block operator tests. The investigation SA is **not** the sandbox pod identity (that name would imply the pod *is* the investigation subject; accidental automount would project a useful host-cluster token).
 
-### Later: proxy (out of scope, extension point)
+### Later: proxy (specified in the proxy pass, not this document)
 
-The same CR and reconciler grow children: proxy Deployment+Service, CA Secret, dummy kubeconfig ConfigMap, route ConfigMap, four NPs (sandbox egress, proxy ingress/egress, …). MCP flags gain `HTTPS_PROXY` / dummy mount via pod-spec changes in `pkg/session`. The admin still provides the **real** kubeconfig Secret (`cli-mcp-<name>-kubeconfig`); the operator derives dummy + routes and **stops mounting the real Secret on sandbox pods**.
+The same CR and reconciler grow children. HOW/WHAT: [credential-proxy-design.md](credential-proxy-design.md) (**Final**, Q1–Q11). The admin still provides the **real** kubeconfig Secret when a kubernetes target exists (default `cli-mcp-<name>-kubeconfig`, or that target’s `secretName`); the operator derives dummy + routes and **stops mounting the real Secret on sandbox pods**.
 
-Do not add `spec.proxy` in this CRD (Q14). Same Kind later; additive fields and children in the proxy pass.
+Proxy Q1 adds required `spec.proxy.targets` on this CRD (operator Q14 deferred the stub until that decision). Do not skip the dummy mount because a Secret is missing — that is not Ready.
 
 ## Core Concepts
 
@@ -462,15 +462,15 @@ Today `make run` is `go run ./cmd/server`. After Phase 2, Kubebuilder `make run`
 
 ### CR API (v1)
 
-Typed instance spec (Q6, Q16): one CR = one **sandbox class** (image + config) + one MCP Deployment. `spec.replicas` (default **1**, minimum 1; sample may use 2). `spec.sandbox` (image, idle default **30m**, pool default **0**, resources, env, imagePullPolicy). Optional `spec.serverContainer` (MCP container resources / imagePullPolicy only — image is `RELATED_IMAGE_SERVER`, not a spec field). No HMAC secret ref (operator-owned). No investigation kubeconfig secret ref (conventional name `cli-mcp-<name>-kubeconfig`). No client SA spec field (conventional name `cli-mcp-<name>-client`; published on `status.clientServiceAccount`). No `spec.args` passthrough. No `spec.proxy` in this revision (Q14). No `spec.sandbox.type` enum and no `PodTemplateSpec`.
+Typed instance spec (Q6, Q16): one CR = one **sandbox class** (image + config) + one MCP Deployment. `spec.replicas` (default **1**, minimum 1; sample may use 2). `spec.sandbox` (image, idle default **30m**, pool default **0**, resources, env, imagePullPolicy). Optional `spec.serverContainer` (MCP container resources / imagePullPolicy only — image is `RELATED_IMAGE_SERVER`, not a spec field). No HMAC secret ref (operator-owned). No client SA spec field (conventional name `cli-mcp-<name>-client`; published on `status.clientServiceAccount`). No `spec.args` passthrough. No `spec.sandbox.type` enum and no `PodTemplateSpec`. **Proxy pass** adds required `spec.proxy.targets` (optional kubernetes `secretName`; default conventional kubeconfig Secret name) — see [credential-proxy-design.md](credential-proxy-design.md). This HOW’s sample YAML below is the **pre-proxy** shape.
 
 **Sandbox image contract:** the container must run a compatible agent (`/health`, `/exec`, `/assign` on the agent port, HMAC) and still have `curl` for the as-built exec readiness probe. Typical custom image: `FROM` our sandbox image or COPY `cmd/agent`. This operator does not run arbitrary pods.
 
-**Operator-owned on every sandbox pod** (not spec fields): dedicated SA, `automountServiceAccountToken: false`, instance/component labels, probes, agent port, kubeconfig mount **this phase** (Q12), today’s non-root / drop-caps security context. Session token env only when assigned (on-demand create) or via `/assign` (claimed pool). User `env` entries for `KUBECONFIG`, `HOME`, `SANDBOX_AUTH_TOKEN` are ignored (operator wins).
+**Operator-owned on every sandbox pod** (not spec fields): dedicated SA, `automountServiceAccountToken: false`, instance/component labels, probes, agent port, kubeconfig mount **this phase** (Q12), today’s non-root / drop-caps security context. Session token env only when assigned (on-demand create) or via `/assign` (claimed pool). User `env` entries for `KUBECONFIG`, `HOME`, `SANDBOX_AUTH_TOKEN` are ignored (operator wins). Proxy pass also reserves `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`.
 
 **User-mergeable now** on `spec.sandbox`: `image`, `resources`, `env` (`[]corev1.EnvVar`, including `valueFrom`), `imagePullPolicy`. Empty `image` → `RELATED_IMAGE_SANDBOX` (the class we ship). Set `image` for another class (first-class, not a test pin). Empty `resources` → as-built DefaultConfig requests/limits (`100m`/`500m`/`128Mi`/`512Mi`), not an empty ResourceRequirements. Extra Secrets in `valueFrom` are admin-owned; they are **not** Ready gates (a missing one shows up as a non-Ready sandbox pod).
 
-**Later, same object** (do not stub now): extra volumes/mounts, `imagePullSecrets`, args, `securityContext` override, optional kubeconfig mount, agent port. A class that does not need kubeconfig is an additive change (skip mount if Secret absent), not a new Kind.
+**Later, same object** (do not stub now): extra volumes/mounts, `imagePullSecrets`, args, `securityContext` override, agent port. Skipping the dummy kubeconfig mount is **not** “Secret absent” — that is proxy Q1 (no kubernetes target). A kubernetes target with a missing Secret is not Ready (`SecretsNotFound`), not a skipped mount.
 
 ```yaml
 apiVersion: cli-mcp.redhat.com/v1alpha1
@@ -506,11 +506,11 @@ status:
     - type: WarmPoolReady  # optional; strict unassigned Ready count
 ```
 
-Q15: `Ready` is investigation kubeconfig Secret `cli-mcp-<name>-kubeconfig` present with non-empty `kubeconfig` (TLS Secret on generic Kubernetes with `tls.crt`/`tls.key`; HMAC with non-empty `key`), other children applied (including client SA/Role/RoleBinding and ConfigMap `cli-mcp-<name>-krp`), ClusterRoleBinding `cli-mcp-auth-delegator` listing this instance’s MCP SA while it is not deleting (foreign `roleRef` or apply failure → `ChildrenNotReady`), and MCP Deployment Available (kube-rbac-proxy + server, sidecar mounting the krp ConfigMap with RV stamp). Missing object → `SecretsNotFound`; missing/empty required key → `SecretKeysInvalid`; do not parse kubeconfig. Extra Secrets referenced from `spec.sandbox.env` are **not** Ready gates. No client token Secret is a Ready gate; always publish `status.clientServiceAccount`. If `warmPoolSize > 0`, first Ready, a pool-size increase, **and an overlay/hash rebuild of unassigned pods** wait until `warmPoolReady >= warmPoolDesired`. After that, claim/replenish does not clear `Ready` unless a pool pod is Failed/backoff or the shortfall lasts past a replenish deadline (operator constant **5m**, not a spec field). Assigned sessions are not part of Ready. Always publish `warmPoolReady` / `warmPoolDesired`.
+Q15: `Ready` is investigation kubeconfig Secret present with non-empty `kubeconfig` (TLS Secret on generic Kubernetes with `tls.crt`/`tls.key`; HMAC with non-empty `key`), other children applied (including client SA/Role/RoleBinding and ConfigMap `cli-mcp-<name>-krp`), ClusterRoleBinding `cli-mcp-auth-delegator` listing this instance’s MCP SA while it is not deleting (foreign `roleRef` or apply failure → `ChildrenNotReady`), and MCP Deployment Available (kube-rbac-proxy + server, sidecar mounting the krp ConfigMap with RV stamp). Missing object → `SecretsNotFound`; missing/empty required key → `SecretKeysInvalid`. **This HOW does not parse kubeconfig.** Proxy pass Q4 adds token-only parse of the **effective** Secret when a kubernetes target exists (`KubeconfigInvalid` on failure) and folds proxy children into the same `Ready` — [credential-proxy-design.md](credential-proxy-design.md). Extra Secrets referenced from `spec.sandbox.env` are **not** Ready gates. No client token Secret is a Ready gate; always publish `status.clientServiceAccount`. If `warmPoolSize > 0`, first Ready, a pool-size increase, **and an overlay/hash rebuild of unassigned pods** wait until `warmPoolReady >= warmPoolDesired`. After that, claim/replenish does not clear `Ready` unless a pool pod is Failed/backoff or the shortfall lasts past a replenish deadline (operator constant **5m**, not a spec field). Assigned sessions are not part of Ready. Always publish `warmPoolReady` / `warmPoolDesired`.
 
 ## Implementation Plan
 
-Do **not** start the paused proxy work. This plan is operator + current MCP only. The MCP is not in production; **later phases may break earlier MCP flag defaults, labels, and deploy YAML.** Prefer that over a dual code path.
+This plan is operator + current MCP only (phases 1–5 + client auth). Proxy children are a **different** plan: [credential-proxy-design.md](credential-proxy-design.md). The MCP is not in production; **later phases may break earlier MCP flag defaults, labels, and deploy YAML.** Prefer that over a dual code path.
 
 Phase 3 removes MCP `startCleanupLoop` / `CleanupStale`. **Idle GC of assigned sessions lands in Phase 4** with instance children (same label list as the finalizer, plus `last-activity`; not the two-writer pool). Phase 5 is warm pool + Ready pool-init / no-flap-on-claim only. The first catalog therefore has a janitor.
 
@@ -626,9 +626,9 @@ Other repo / GitOps: CatalogSource + OperatorGroup + Subscription + one `CliMcpI
 
 This path is **test/validation only** (dev cluster, kind, a non-prod overlay). Verify `bash` creates a sandbox and other pods cannot hit `:8090`. **Do not** wire TARSy or any production/stage MCP client — sandbox still mounts the real kubeconfig and egress is unrestricted. First-party production/stage client wiring waits until proxy children and sandbox egress lock exist and pass the isolation checks in the proxy HOW. That is a **later implementation plan**, not Phase 7’s doc rewrite.
 
-### Phase 7 — Return to proxy design — **no PR in this repo (docs / later PRs)**
+### Phase 7 — Proxy pass design — **docs in this repo; implementation is later PRs**
 
-Rewrite [credential-proxy-design.md](credential-proxy-design.md) HOW against this operator. Resume proxy Q2–Q12. Then a **new** implementation plan for proxy children — not more phases of 1–5. Shipping that plan (not this rewrite) is what unlocks production/stage first-party MCP client wiring.
+[credential-proxy-design.md](credential-proxy-design.md) and [credential-proxy-questions.md](credential-proxy-questions.md) are the proxy-pass pair (Final; Q1–Q11 decided). Implement that plan — not more phases of 1–5. Shipping the proxy children (not this operator HOW) is what unlocks production/stage first-party MCP client wiring.
 
 ## Out of scope / non-goals
 

@@ -2,7 +2,7 @@
 
 **Status:** Implemented (as-built)
 
-**Related:** [Sketch](sketch.md) · [Detailed Design](design.md) · [README](../README.md)
+**Related:** [Sketch](sketch.md) · [Detailed Design](design.md) · [README](../README.md) · [Credential proxy (Final, not implemented)](proposals/credential-proxy-design.md)
 
 ## What it is
 
@@ -60,7 +60,7 @@ No command allowlist. Capability is what the image and investigation RBAC allow:
 
 - Per-session pod isolation
 - Read-only investigation ServiceAccount / kubeconfig
-- NetworkPolicy (ingress from MCP server; egress to intended APIs)
+- NetworkPolicy (ingress from MCP server; egress unrestricted until the [credential proxy](proposals/credential-proxy-design.md) lands)
 - Per-session HMAC bearer token on agent `/exec`
 - Ephemeral `/workspace` (`emptyDir`)
 - Resource limits and command timeouts

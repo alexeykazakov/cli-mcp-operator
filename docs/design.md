@@ -2,7 +2,7 @@
 
 **Status:** Implemented (as-built)
 
-**Related:** [Sketch](sketch.md) · [Architecture Overview](architecture-overview.md) · [README](../README.md)
+**Related:** [Sketch](sketch.md) · [Architecture Overview](architecture-overview.md) · [README](../README.md) · [Credential proxy (Final, not implemented)](proposals/credential-proxy-design.md)
 
 ## Design principles
 
@@ -88,7 +88,7 @@ Bash is a long-lived process (`bash --norc --noprofile`) with pipe I/O and a del
 | Investigation RBAC | Read-only SA/kubeconfig mounted into sandbox pods |
 | Pod isolation | One pod per session; non-root, no privilege escalation, caps dropped |
 | Agent auth | `HMAC-SHA256(shared_secret, session_id)` bearer on `/exec` |
-| Network | Ingress from MCP server; egress limited to intended APIs |
+| Network | Ingress from MCP server; egress **unrestricted today** (token-replay gap). Isolation is [credential-proxy-design.md](proposals/credential-proxy-design.md) (Final, not implemented) |
 | Ephemeral storage | `/workspace` is `emptyDir` — gone with the pod |
 | Limits | CPU/memory, command timeout, idle TTL |
 
