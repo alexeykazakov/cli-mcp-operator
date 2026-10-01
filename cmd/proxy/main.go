@@ -119,9 +119,10 @@ func serve(configPath, caCertPath, caKeyPath, listen string) error {
 // mitmTracker follows connections goproxy hijacks for CONNECT MITM.
 // http.Server drops them at Hijack, so Shutdown will not close them.
 type mitmTracker struct {
-	mu    sync.Mutex
-	cond  *sync.Cond
-	conns map[net.Conn]struct{}
+	mu       sync.Mutex
+	cond     *sync.Cond
+	conns    map[net.Conn]struct{}
+	draining bool
 }
 
 func newMitmTracker() *mitmTracker {
@@ -132,6 +133,11 @@ func newMitmTracker() *mitmTracker {
 
 func (t *mitmTracker) add(conn net.Conn) {
 	t.mu.Lock()
+	if t.draining {
+		t.mu.Unlock()
+		_ = conn.Close()
+		return
+	}
 	t.conns[conn] = struct{}{}
 	t.mu.Unlock()
 }
@@ -160,6 +166,7 @@ func (t *mitmTracker) drain(ctx context.Context) {
 	}()
 
 	t.mu.Lock()
+	t.draining = true
 	for len(t.conns) > 0 && ctx.Err() == nil {
 		t.cond.Wait()
 	}

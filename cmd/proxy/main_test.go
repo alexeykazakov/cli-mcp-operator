@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -11,6 +12,7 @@ import (
 	"encoding/pem"
 	"flag"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -157,6 +159,52 @@ func TestServe(t *testing.T) {
 			t.Fatal("serve did not return after SIGTERM")
 		}
 	})
+}
+
+func TestMitmTrackerAddDuringDrainCloses(t *testing.T) {
+	t.Parallel()
+
+	tracker := newMitmTracker()
+	earlyServer, earlyClient := net.Pipe()
+	t.Cleanup(func() {
+		_ = earlyServer.Close()
+		_ = earlyClient.Close()
+	})
+	tracker.add(earlyServer)
+	require.NoError(t, earlyClient.SetReadDeadline(time.Now().Add(30*time.Millisecond)))
+	_, err := earlyClient.Read(make([]byte, 1))
+	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		tracker.drain(ctx)
+		close(done)
+	}()
+	require.Eventually(t, func() bool {
+		tracker.mu.Lock()
+		defer tracker.mu.Unlock()
+		return tracker.draining
+	}, time.Second, 5*time.Millisecond)
+
+	lateServer, lateClient := net.Pipe()
+	t.Cleanup(func() {
+		_ = lateServer.Close()
+		_ = lateClient.Close()
+	})
+	tracker.add(lateServer)
+	_, err = lateClient.Read(make([]byte, 1))
+	require.ErrorIs(t, err, io.EOF)
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("drain did not return")
+	}
+	_, err = earlyClient.Read(make([]byte, 1))
+	require.ErrorIs(t, err, io.EOF)
 }
 
 func openMITM(t *testing.T, addr, certPath string) *tls.Conn {
