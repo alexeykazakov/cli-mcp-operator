@@ -38,7 +38,7 @@ func ParseConfig(data []byte) (*Config, error) {
 
 // LoadConfig reads route JSON from path.
 func LoadConfig(path string) (*Config, error) {
-	data, err := os.ReadFile(path) //nolint:gosec // path is the operator-provided config file
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}

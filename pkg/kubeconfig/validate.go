@@ -23,7 +23,7 @@ func Validate(data []byte) (*clientcmdapi.Config, error) {
 	if len(cfg.Clusters) == 0 {
 		return nil, fmt.Errorf("kubeconfig has no clusters")
 	}
-	if err := validateAuthInfos(cfg); err != nil {
+	if err = validateAuthInfos(cfg); err != nil {
 		return nil, err
 	}
 	hosts, err := indexClusters(cfg)
@@ -46,7 +46,7 @@ func LoadTokens(data []byte) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := assignContextTokens(cfg, hosts); err != nil {
+	if err = assignContextTokens(cfg, hosts); err != nil {
 		return nil, err
 	}
 	tokens := make(map[string]string, len(hosts))

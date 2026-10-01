@@ -22,7 +22,7 @@ type kubernetesInjector struct {
 
 func newKubernetesInjector(path string) (*kubernetesInjector, error) {
 	// Path is the kubeconfig the operator mounted for this route.
-	data, err := os.ReadFile(path) //nolint:gosec // operator-mounted kubeconfig path
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read kubeconfig: %w", err)
 	}

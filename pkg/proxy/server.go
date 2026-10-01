@@ -124,7 +124,9 @@ func newGoproxy(ca *tls.Certificate, table *routeTable, logger *slog.Logger) *go
 		func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
 			if _, ok := table.cfg.Match(host); !ok {
 				logger.Warn("blocked CONNECT", "host", host)
-				ctx.Resp = textResponse(ctx.Req, http.StatusForbidden, "domain not allowed")
+				resp := textResponse(ctx.Req, http.StatusForbidden, "domain not allowed")
+				defer func() { _ = resp.Body.Close() }()
+				ctx.Resp = resp
 				return reject, host
 			}
 			return mitm, host
@@ -148,6 +150,10 @@ func (t *routeTable) handle(req *http.Request, logger *slog.Logger) (*http.Reque
 	if route.Injector == kubeconfig.InjectorKubernetes && kubePathDenied(req.URL.Path) {
 		logger.Warn("blocked kube path", "host", route.Domain, "path", req.URL.Path)
 		return req, textResponse(req, http.StatusForbidden, "path not allowed")
+	}
+	if route.Injector == kubeconfig.InjectorKubernetes && req.URL.Scheme != "https" {
+		logger.Warn("blocked plaintext kube request", "host", route.Domain)
+		return req, textResponse(req, http.StatusForbidden, "https required")
 	}
 	injector := t.injectors[route.Domain]
 	if injector == nil {

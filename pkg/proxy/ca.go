@@ -27,7 +27,7 @@ func parseCA(certPEM, keyPEM []byte) (*x509.Certificate, *ecdsa.PrivateKey, erro
 		return nil, nil, fmt.Errorf("parse CA: private key is not P-256")
 	}
 	pub, ok := cert.PublicKey.(*ecdsa.PublicKey)
-	if !ok || pub.X.Cmp(key.X) != 0 || pub.Y.Cmp(key.Y) != 0 {
+	if !ok || !pub.Equal(key.Public()) {
 		return nil, nil, fmt.Errorf("parse CA: private key does not match certificate")
 	}
 	return cert, key, nil

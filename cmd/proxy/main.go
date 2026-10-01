@@ -51,11 +51,11 @@ func serve(configPath, caCertPath, caKeyPath, listen string) error {
 	if err != nil {
 		return err
 	}
-	caCert, err := os.ReadFile(caCertPath) //nolint:gosec // operator-mounted CA certificate path
+	caCert, err := os.ReadFile(caCertPath)
 	if err != nil {
 		return fmt.Errorf("read CA cert: %w", err)
 	}
-	caKey, err := os.ReadFile(caKeyPath) //nolint:gosec // operator-mounted CA key path
+	caKey, err := os.ReadFile(caKeyPath)
 	if err != nil {
 		return fmt.Errorf("read CA key: %w", err)
 	}

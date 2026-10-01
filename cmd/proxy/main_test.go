@@ -74,7 +74,7 @@ func TestServe(t *testing.T) {
 		dir := t.TempDir()
 		configPath := writeRoutes(t, dir)
 		certPath, keyPath := writeCA(t, dir)
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 		require.NoError(t, err)
 		addr := ln.Addr().String()
 		require.NoError(t, ln.Close())
@@ -85,7 +85,7 @@ func TestServe(t *testing.T) {
 		}()
 
 		require.Eventually(t, func() bool {
-			conn, dialErr := net.DialTimeout("tcp", addr, 50*time.Millisecond)
+			conn, dialErr := (&net.Dialer{Timeout: 50 * time.Millisecond}).DialContext(t.Context(), "tcp", addr)
 			if dialErr != nil {
 				return false
 			}
@@ -93,7 +93,7 @@ func TestServe(t *testing.T) {
 			return true
 		}, 5*time.Second, 10*time.Millisecond)
 
-		conn, err := net.Dial("tcp", addr)
+		conn, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(t.Context(), "tcp", addr)
 		require.NoError(t, err)
 		require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
 		_, err = fmt.Fprintf(conn, "CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:443\r\n\r\n")

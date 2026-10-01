@@ -38,7 +38,7 @@ func TestParseCAKeyFormats(t *testing.T) {
 		got, gotKey, err := parseCA(certPEM, keyPEM)
 		require.NoError(t, err)
 		assert.True(t, cert.Equal(got))
-		assert.Equal(t, 0, key.D.Cmp(gotKey.D))
+		assert.True(t, key.Equal(gotKey))
 	})
 
 	t.Run("rsa pkcs8", func(t *testing.T) {

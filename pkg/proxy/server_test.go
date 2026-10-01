@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/tls"
 	"crypto/x509"
@@ -57,24 +58,21 @@ func TestKubernetesStripInjectAndDenylist(t *testing.T) {
 
 	const investigation = "investigation-token"
 	seen := &headerLog{}
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	upstreamCACert, _, upstreamCA, upstreamKey := generateCA(t, elliptic.P256())
+	upstream := tlsUpstream(t, upstreamCA, upstreamKey, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seen.record(r)
 		w.WriteHeader(http.StatusOK)
 	}))
-	t.Cleanup(upstream.Close)
 
 	host := upstream.Listener.Addr().String()
-	caPEM, _, _, _ := generateCA(t, elliptic.P256())
-	cfg := kubeConfig(t, host, investigation, caPEM)
+	cfg := kubeConfig(t, host, upstreamCACert)
 	routes := mustProxyRoutes(t, cfg, writeKubeconfig(t, cfg))
-	srv := startProxy(t, routes, nil)
+	proxyCA, proxyKey, proxyCert, _ := generateCA(t, elliptic.P256())
+	srv := startProxy(t, routes, &caFiles{cert: proxyCA, key: proxyKey})
 
 	headers := stolenHeaders()
-	ok := doProxy(t, srv.URL, upstream.URL+"/api/v1/namespaces/ns/pods/p/log?watch=true", headers)
-	assert.Equal(t, http.StatusOK, ok.StatusCode)
-
-	explain := doProxy(t, srv.URL, upstream.URL+"/openapi/v2", headers)
-	assert.Equal(t, http.StatusOK, explain.StatusCode)
+	assert.Equal(t, http.StatusOK, doProxyTrusting(t, srv.URL, upstream.URL+"/api/v1/namespaces/ns/pods/p/log?watch=true", headers, proxyCert))
+	assert.Equal(t, http.StatusOK, doProxyTrusting(t, srv.URL, upstream.URL+"/openapi/v2", headers, proxyCert))
 
 	for _, path := range []string{
 		"/api/v1/namespaces/ns/pods/p/exec",
@@ -82,9 +80,9 @@ func TestKubernetesStripInjectAndDenylist(t *testing.T) {
 		"/api/v1/namespaces/ns/pods/p/portforward",
 		"/api/v1/namespaces/ns/pods/p/proxy/metrics",
 	} {
-		resp := doProxy(t, srv.URL, upstream.URL+path, headers)
-		assert.Equal(t, http.StatusForbidden, resp.StatusCode, path)
+		assert.Equal(t, http.StatusForbidden, doProxyTrusting(t, srv.URL, upstream.URL+path, headers, proxyCert), path)
 	}
+	assert.Equal(t, http.StatusForbidden, doProxy(t, srv.URL, "http://"+host+"/api", headers))
 
 	require.Len(t, seen.snapshot(), 2)
 	got := seen.snapshot()[0]
@@ -113,8 +111,7 @@ func TestNoneStripsWithoutDenylist(t *testing.T) {
 
 	host := upstream.Listener.Addr().String()
 	srv := startProxy(t, mustParse(t, noneRoutes(t, host)), nil)
-	resp := doProxy(t, srv.URL, upstream.URL+"/exec", stolenHeaders())
-	assert.Equal(t, http.StatusNoContent, resp.StatusCode)
+	assert.Equal(t, http.StatusNoContent, doProxy(t, srv.URL, upstream.URL+"/exec", stolenHeaders()))
 	require.Len(t, seen.snapshot(), 1)
 	got := seen.snapshot()[0]
 	assert.Empty(t, got.Get("Authorization"))
@@ -145,7 +142,7 @@ func TestNoneMITMUsesProxyCA(t *testing.T) {
 
 	conn := connectOK(t, srv.Listener.Addr().String(), host)
 	tlsConn := tlsClient(t, conn, proxyCert, "127.0.0.1")
-	require.NoError(t, tlsConn.Handshake())
+	require.NoError(t, tlsConn.HandshakeContext(t.Context()))
 	state := tlsConn.ConnectionState()
 	require.NotEmpty(t, state.PeerCertificates)
 	require.NoError(t, state.PeerCertificates[0].CheckSignatureFrom(proxyCert))
@@ -158,7 +155,7 @@ func TestNoneMITMUsesProxyCA(t *testing.T) {
 		ServerName: "127.0.0.1",
 		MinVersion: tls.VersionTLS12,
 	})
-	require.Error(t, upstreamTLS.Handshake())
+	require.Error(t, upstreamTLS.HandshakeContext(t.Context()))
 
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://"+host+"/exec", nil)
 	require.NoError(t, err)
@@ -190,14 +187,14 @@ func TestKubernetesMITMVerifiesRouteCA(t *testing.T) {
 	t.Cleanup(upstream.Close)
 
 	host := upstream.Listener.Addr().String()
-	kcfg := kubeConfig(t, host, investigation, upstreamCACert)
+	kcfg := kubeConfig(t, host, upstreamCACert)
 	routes := mustProxyRoutes(t, kcfg, writeKubeconfig(t, kcfg))
 	proxyCA, proxyKey, proxyCert, _ := generateCA(t, elliptic.P256())
 	srv := startProxy(t, routes, &caFiles{cert: proxyCA, key: proxyKey})
 
 	conn := connectOK(t, srv.Listener.Addr().String(), host)
 	tlsConn := tlsClient(t, conn, proxyCert, "127.0.0.1")
-	require.NoError(t, tlsConn.Handshake())
+	require.NoError(t, tlsConn.HandshakeContext(t.Context()))
 
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://"+host+"/api/v1/namespaces/ns/pods/p/log", nil)
 	require.NoError(t, err)
@@ -250,7 +247,7 @@ func TestNewServerRejectsMissingToken(t *testing.T) {
 	t.Parallel()
 
 	caPEM, _, _, _ := generateCA(t, elliptic.P256())
-	path := writeKubeconfig(t, kubeConfig(t, "other.example:6443", "investigation-token", caPEM))
+	path := writeKubeconfig(t, kubeConfig(t, "other.example:6443", caPEM))
 	body, err := json.Marshal(map[string]any{
 		"routes": []kubeconfig.ProxyRoute{{
 			Domain:         "api.example.com:6443",
@@ -269,20 +266,18 @@ func TestNewServerRejectsMissingToken(t *testing.T) {
 func TestKubernetesRoutesUseDistinctTokens(t *testing.T) {
 	t.Parallel()
 
+	caPEM, _, ca, key := generateCA(t, elliptic.P256())
 	newUpstream := func() (*httptest.Server, *headerLog) {
 		t.Helper()
 		seen := &headerLog{}
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		srv := tlsUpstream(t, ca, key, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			seen.record(r)
 			w.WriteHeader(http.StatusAccepted)
 		}))
-		t.Cleanup(srv.Close)
 		return srv, seen
 	}
 	upA, seenA := newUpstream()
 	upB, seenB := newUpstream()
-
-	caPEM, _, _, _ := generateCA(t, elliptic.P256())
 	cfg := &clientcmdapi.Config{
 		CurrentContext: "a",
 		Clusters: map[string]*clientcmdapi.Cluster{
@@ -298,12 +293,11 @@ func TestKubernetesRoutesUseDistinctTokens(t *testing.T) {
 			"b": {Cluster: "b", AuthInfo: "ub"},
 		},
 	}
-	srv := startProxy(t, mustProxyRoutes(t, cfg, writeKubeconfig(t, cfg)), nil)
+	proxyCA, proxyKey, proxyCert, _ := generateCA(t, elliptic.P256())
+	srv := startProxy(t, mustProxyRoutes(t, cfg, writeKubeconfig(t, cfg)), &caFiles{cert: proxyCA, key: proxyKey})
 
-	respA := doProxy(t, srv.URL, upA.URL+"/api", stolenHeaders())
-	respB := doProxy(t, srv.URL, upB.URL+"/api", stolenHeaders())
-	assert.Equal(t, http.StatusAccepted, respA.StatusCode)
-	assert.Equal(t, http.StatusAccepted, respB.StatusCode)
+	assert.Equal(t, http.StatusAccepted, doProxyTrusting(t, srv.URL, upA.URL+"/api", stolenHeaders(), proxyCert))
+	assert.Equal(t, http.StatusAccepted, doProxyTrusting(t, srv.URL, upB.URL+"/api", stolenHeaders(), proxyCert))
 	require.Len(t, seenA.snapshot(), 1)
 	require.Len(t, seenB.snapshot(), 1)
 	assert.Equal(t, "Bearer token-a", seenA.snapshot()[0].Get("Authorization"))
@@ -316,12 +310,12 @@ func TestHandlerUsesHostHeaderWhenURLHostEmpty(t *testing.T) {
 	t.Parallel()
 
 	caPEM, keyPEM, _, _ := generateCA(t, elliptic.P256())
-	cfg := kubeConfig(t, "api.example.com:6443", "investigation-token", caPEM)
+	cfg := kubeConfig(t, "api.example.com:6443", caPEM)
 	proxy, err := NewServer(mustProxyRoutes(t, cfg, writeKubeconfig(t, cfg)), caPEM, keyPEM, slog.New(slog.DiscardHandler))
 	require.NoError(t, err)
 	t.Cleanup(proxy.CloseIdleConnections)
 
-	req := httptest.NewRequest(http.MethodGet, "http://api.example.com:6443/exec", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://api.example.com:6443/exec", nil)
 	req.URL.Host = ""
 	req.Host = "api.example.com:6443"
 	rec := httptest.NewRecorder()
@@ -354,7 +348,7 @@ func TestNewServerRejectsBadKubeconfig(t *testing.T) {
 
 	t.Run("exec auth", func(t *testing.T) {
 		t.Parallel()
-		cfg := kubeConfig(t, "api.example.com:6443", "investigation-token", []byte(ca))
+		cfg := kubeConfig(t, "api.example.com:6443", []byte(ca))
 		cfg.AuthInfos["u"].Exec = &clientcmdapi.ExecConfig{Command: "oc"}
 		body, err := json.Marshal(map[string]any{
 			"routes": []kubeconfig.ProxyRoute{{
@@ -384,7 +378,7 @@ func TestHandleInjectionFailure(t *testing.T) {
 		Domain:   "api.example.com:6443",
 		Injector: kubeconfig.InjectorKubernetes,
 	}
-	req := httptest.NewRequest(http.MethodGet, "https://api.example.com:6443/api", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "https://api.example.com:6443/api", nil)
 	_, resp := table.handle(req, slog.New(slog.DiscardHandler))
 	require.NotNil(t, resp)
 	t.Cleanup(func() { _ = resp.Body.Close() })
@@ -418,7 +412,7 @@ func mustCA(t *testing.T) ([]byte, []byte, *slog.Logger) {
 	return cert, key, slog.New(slog.DiscardHandler)
 }
 
-func kubeConfig(t *testing.T, host, token string, ca []byte) *clientcmdapi.Config {
+func kubeConfig(t *testing.T, host string, ca []byte) *clientcmdapi.Config {
 	t.Helper()
 	return &clientcmdapi.Config{
 		CurrentContext: "c",
@@ -426,7 +420,7 @@ func kubeConfig(t *testing.T, host, token string, ca []byte) *clientcmdapi.Confi
 			"c": {Server: "https://" + host, CertificateAuthorityData: ca},
 		},
 		AuthInfos: map[string]*clientcmdapi.AuthInfo{
-			"u": {Token: token},
+			"u": {Token: "investigation-token"},
 		},
 		Contexts: map[string]*clientcmdapi.Context{
 			"c": {Cluster: "c", AuthInfo: "u"},
@@ -490,7 +484,24 @@ func newReq(t *testing.T, rawURL string) *http.Request {
 	return req
 }
 
-func doProxy(t *testing.T, proxyURL, rawURL string, headers http.Header) *http.Response {
+func tlsUpstream(t *testing.T, ca *x509.Certificate, caKey *ecdsa.PrivateKey, handler http.Handler) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewUnstartedServer(handler)
+	srv.TLS = &tls.Config{
+		Certificates: []tls.Certificate{signServerCert(t, ca, caKey, net.ParseIP("127.0.0.1"))},
+		MinVersion:   tls.VersionTLS12,
+	}
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func doProxy(t *testing.T, proxyURL, rawURL string, headers http.Header) int {
+	t.Helper()
+	return doProxyTrusting(t, proxyURL, rawURL, headers, nil)
+}
+
+func doProxyTrusting(t *testing.T, proxyURL, rawURL string, headers http.Header, ca *x509.Certificate) int {
 	t.Helper()
 	req := newReq(t, rawURL)
 	for key, values := range headers {
@@ -498,15 +509,24 @@ func doProxy(t *testing.T, proxyURL, rawURL string, headers http.Header) *http.R
 			req.Header.Add(key, value)
 		}
 	}
-	resp, err := proxyClient(t, proxyURL).Do(req)
+	client := proxyClient(t, proxyURL)
+	if ca != nil {
+		pool := x509.NewCertPool()
+		pool.AddCert(ca)
+		client.Transport.(*http.Transport).TLSClientConfig = &tls.Config{
+			RootCAs:    pool,
+			MinVersion: tls.VersionTLS12,
+		}
+	}
+	resp, err := client.Do(req)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = resp.Body.Close() })
-	return resp
+	defer func() { _ = resp.Body.Close() }()
+	return resp.StatusCode
 }
 
 func assertConnectStatus(t *testing.T, proxyAddr, target string, status int) {
 	t.Helper()
-	conn, err := net.Dial("tcp", proxyAddr)
+	conn, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(t.Context(), "tcp", proxyAddr)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = conn.Close() })
 	require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
@@ -529,7 +549,7 @@ func (c bufferedConn) Read(p []byte) (int, error) {
 
 func connectOK(t *testing.T, proxyAddr, target string) net.Conn {
 	t.Helper()
-	conn, err := net.Dial("tcp", proxyAddr)
+	conn, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(t.Context(), "tcp", proxyAddr)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = conn.Close() })
 	require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))

@@ -11,7 +11,7 @@ import (
 func TestStripAuthHeaders(t *testing.T) {
 	t.Parallel()
 
-	req := httptest.NewRequest(http.MethodGet, "https://api.example.com:6443/api", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "https://api.example.com:6443/api", nil)
 	req.Header.Set("Authorization", "Bearer stolen")
 	req.Header.Set("X-Api-Key", "client-key")
 	req.Header.Set("Proxy-Authorization", "Basic abc")
