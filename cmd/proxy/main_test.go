@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -112,6 +113,91 @@ func TestServe(t *testing.T) {
 			t.Fatal("serve did not return after SIGTERM")
 		}
 	})
+
+	t.Run("closes mitm tunnels", func(t *testing.T) {
+		prev := shutdownTimeout
+		shutdownTimeout = 300 * time.Millisecond
+		t.Cleanup(func() { shutdownTimeout = prev })
+
+		dir := t.TempDir()
+		configPath := writeRoutes(t, dir)
+		certPath, keyPath := writeCA(t, dir)
+		ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		addr := ln.Addr().String()
+		require.NoError(t, ln.Close())
+
+		done := make(chan error, 1)
+		go func() {
+			done <- serve(configPath, certPath, keyPath, addr)
+		}()
+		require.Eventually(t, func() bool {
+			conn, dialErr := (&net.Dialer{Timeout: 50 * time.Millisecond}).DialContext(t.Context(), "tcp", addr)
+			if dialErr != nil {
+				return false
+			}
+			_ = conn.Close()
+			return true
+		}, 5*time.Second, 10*time.Millisecond)
+
+		tunnel := openMITM(t, addr, certPath)
+		require.NoError(t, syscall.Kill(os.Getpid(), syscall.SIGTERM))
+
+		started := time.Now()
+		require.NoError(t, tunnel.SetReadDeadline(time.Now().Add(2*time.Second)))
+		_, err = tunnel.Read(make([]byte, 1))
+		require.Error(t, err)
+		assert.Less(t, time.Since(started), time.Second)
+		require.NoError(t, tunnel.Close())
+
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-time.After(2 * time.Second):
+			t.Fatal("serve did not return after SIGTERM")
+		}
+	})
+}
+
+func openMITM(t *testing.T, addr, certPath string) *tls.Conn {
+	t.Helper()
+	raw, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(t.Context(), "tcp", addr)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = raw.Close() })
+	require.NoError(t, raw.SetDeadline(time.Now().Add(5*time.Second)))
+	_, err = fmt.Fprintf(raw, "CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:443\r\n\r\n")
+	require.NoError(t, err)
+	reader := bufio.NewReader(raw)
+	resp, err := http.ReadResponse(reader, nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.NoError(t, resp.Body.Close())
+
+	pemBytes, err := os.ReadFile(certPath)
+	require.NoError(t, err)
+	block, _ := pem.Decode(pemBytes)
+	require.NotNil(t, block)
+	cert, err := x509.ParseCertificate(block.Bytes)
+	require.NoError(t, err)
+	pool := x509.NewCertPool()
+	pool.AddCert(cert)
+
+	tunnel := tls.Client(&prefixConn{Conn: raw, reader: reader}, &tls.Config{
+		RootCAs:    pool,
+		ServerName: "api.example.com",
+		MinVersion: tls.VersionTLS12,
+	})
+	require.NoError(t, tunnel.HandshakeContext(t.Context()))
+	return tunnel
+}
+
+type prefixConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c prefixConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
 }
 
 func writeRoutes(t *testing.T, dir string) string {
