@@ -41,14 +41,18 @@ const (
 	// after first Ready before aggregate Ready is cleared. First Ready and
 	// overlay/size-increase waits are not deadline-bounded.
 	poolReplenishDeadline = 5 * time.Minute
+	// proxyGateRetry is the wait before looking again when the proxy gate is
+	// closed and a warm pool is desired. EndpointSlice updates are not watched.
+	proxyGateRetry = 2 * time.Second
 )
 
 type poolSnapshot struct {
-	desired        int32
-	ready          int32
-	unhealthy      bool
-	unhealthyMsg   string
-	overlayRebuild bool
+	desired         int32
+	ready           int32
+	unhealthy       bool
+	unhealthyMsg    string
+	overlayRebuild  bool
+	proxyGateClosed bool
 }
 
 func isAssignedSandbox(pod corev1.Pod) bool {
@@ -109,13 +113,30 @@ func (r *CliMcpInstanceReconciler) reconcilePool(ctx context.Context, inst *clim
 	if !mutate {
 		return observePool(pods.Items, desired), nil
 	}
-
-	cfg := r.poolSandboxConfig(inst)
-	hash, err := overlayHash(cfg)
+	// Nothing to create. Drop leftover unassigned pods without the proxy gate
+	// or overlay inputs; a closed gate must not keep a disabled pool.
+	if desired == 0 {
+		return r.reconcileZeroPool(ctx, inst, pods.Items)
+	}
+	open, err := r.proxyPoolOpen(ctx, inst)
 	if err != nil {
 		return observePool(pods.Items, desired), err
 	}
-	if desired > 0 && cfg.Image == "" {
+	if !open {
+		snap := observePool(pods.Items, desired)
+		snap.proxyGateClosed = desired > 0
+		return snap, nil
+	}
+
+	cfg, dummy, ca, err := r.overlayInputs(ctx, inst)
+	if err != nil {
+		return observePool(pods.Items, desired), err
+	}
+	hash, err := overlayHash(cfg, dummy, ca)
+	if err != nil {
+		return observePool(pods.Items, desired), err
+	}
+	if cfg.Image == "" {
 		return observePool(pods.Items, desired), fmt.Errorf("sandbox image is empty: set spec.sandbox.image or %s", envRelatedImageSandbox)
 	}
 
@@ -183,6 +204,32 @@ func (r *CliMcpInstanceReconciler) reconcilePool(ctx context.Context, inst *clim
 	}
 
 	return r.observeAfterMutate(ctx, inst, desired, pre, nil)
+}
+
+// reconcileZeroPool deletes every live unassigned pod. Assigned and already
+// terminating pods stay. Surplus at size zero includes stale and unhealthy pods,
+// so this does not read the proxy or the overlay hash.
+func (r *CliMcpInstanceReconciler) reconcileZeroPool(ctx context.Context, inst *climcpv1alpha1.CliMcpInstance, pods []corev1.Pod) (poolSnapshot, error) {
+	var live []corev1.Pod
+	for i := range pods {
+		pod := pods[i]
+		if !isUnassignedSandbox(pod) || pod.DeletionTimestamp != nil {
+			continue
+		}
+		live = append(live, pod)
+	}
+	if len(live) == 0 {
+		return observePool(pods, 0), nil
+	}
+	slices.SortFunc(live, func(a, b corev1.Pod) int {
+		return a.CreationTimestamp.Compare(b.CreationTimestamp.Time)
+	})
+	for i := range live {
+		if err := r.deleteUnassignedIfStillUnassigned(ctx, &live[i]); err != nil {
+			return r.observeAfterMutate(ctx, inst, 0, poolSnapshot{desired: 0}, err)
+		}
+	}
+	return r.observeAfterMutate(ctx, inst, 0, poolSnapshot{desired: 0}, nil)
 }
 
 // observeAfterMutate re-lists sandbox pods so status matches the cluster after
@@ -302,6 +349,9 @@ func shortfallPastDeadline(orig *climcpv1alpha1.CliMcpInstance, now time.Time) b
 }
 
 func poolRequeueAfter(orig *climcpv1alpha1.CliMcpInstance, pool poolSnapshot, now time.Time) time.Duration {
+	if pool.proxyGateClosed {
+		return proxyGateRetry
+	}
 	if pool.desired == 0 || pool.unhealthy || pool.ready >= pool.desired {
 		return 0
 	}

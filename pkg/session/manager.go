@@ -13,12 +13,17 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/codeready-toolchain/cli-mcp-operator/pkg/agent"
+	"golang.org/x/sync/singleflight"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 )
@@ -28,6 +33,8 @@ const (
 
 	readyPollPeriod = 2 * time.Second
 	readyTimeout    = 60 * time.Second
+	proxyGateTTL    = 5 * time.Second
+	proxyGateFlight = "ready"
 )
 
 var sessionIDRegex = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
@@ -37,12 +44,22 @@ var sessionIDRegex = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 //
 //nolint:revive // name matches design docs
 type SessionManager struct {
-	clientset   kubernetes.Interface
-	config      SandboxConfig
-	cache       *PodCache
-	pool        *WarmPool
-	agentClient *agent.AgentClient
-	logger      *slog.Logger
+	clientset    kubernetes.Interface
+	config       SandboxConfig
+	cache        *PodCache
+	pool         *WarmPool
+	agentClient  *agent.AgentClient
+	logger       *slog.Logger
+	proxyGate    proxyGateCache
+	proxyGateTTL time.Duration
+}
+
+type proxyGateCache struct {
+	mu     sync.Mutex
+	set    bool
+	at     time.Time
+	err    error
+	flight singleflight.Group
 }
 
 // NewSessionManager creates a SessionManager with a default PodCache, agent
@@ -64,8 +81,8 @@ func NewSessionManager(clientset kubernetes.Interface, config SandboxConfig, log
 	if config.ServiceAccountName == "" {
 		return nil, fmt.Errorf("SandboxConfig.ServiceAccountName must not be empty")
 	}
-	if config.KubeconfigSecret == "" {
-		return nil, fmt.Errorf("SandboxConfig.KubeconfigSecret must not be empty")
+	if err := validateSandboxIdentity(config); err != nil {
+		return nil, err
 	}
 	if logger == nil {
 		logger = slog.Default()
@@ -81,9 +98,27 @@ func NewSessionManager(clientset kubernetes.Interface, config SandboxConfig, log
 			agent.WithPort(config.AgentPort),
 			agent.WithTimeout(0),
 		),
-		logger: logger,
+		logger:       logger,
+		proxyGateTTL: proxyGateTTL,
 	}
 	return mgr, nil
+}
+
+func validateSandboxIdentity(config SandboxConfig) error {
+	proxy := config.ProxyService != "" || config.ProxyCASecret != "" || config.DummyKubeconfigConfigMap != ""
+	if proxy {
+		if config.ProxyService == "" || config.ProxyCASecret == "" {
+			return fmt.Errorf("SandboxConfig.ProxyService and ProxyCASecret are required together")
+		}
+		if config.KubeconfigSecret != "" {
+			return fmt.Errorf("SandboxConfig.KubeconfigSecret must be empty when proxy flags are set")
+		}
+		return nil
+	}
+	if config.KubeconfigSecret == "" {
+		return fmt.Errorf("SandboxConfig.KubeconfigSecret must not be empty")
+	}
+	return nil
 }
 
 // Pool returns the claim helper. Exposed for testing.
@@ -113,6 +148,101 @@ func ValidateSessionID(sessionID string) error {
 	return nil
 }
 
+// ensureProxyReady lists this proxy Service's EndpointSlices and GETs the sandbox NetworkPolicy.
+// Already-assigned sessions do not call this. Success and other lookup failures
+// are cached for a short TTL. context.Canceled and context.DeadlineExceeded are
+// not cached. The mutex covers only that cache; concurrent callers share one lookup.
+func (m *SessionManager) ensureProxyReady(ctx context.Context) error {
+	if m.config.ProxyService == "" {
+		return nil
+	}
+	if ok, gateErr := m.cachedProxyGate(); ok {
+		return gateErr
+	}
+	ch := m.proxyGate.flight.DoChan(proxyGateFlight, func() (any, error) {
+		if ok, gateErr := m.cachedProxyGate(); ok {
+			return gateErr, nil
+		}
+		lookupErr := m.lookupProxyReady(ctx)
+		if proxyGateCacheable(lookupErr) {
+			m.storeProxyGate(lookupErr)
+		}
+		return lookupErr, nil
+	})
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case res := <-ch:
+		if res.Err != nil {
+			return res.Err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		gateErr, _ := res.Val.(error)
+		return gateErr
+	}
+}
+
+func (m *SessionManager) cachedProxyGate() (bool, error) {
+	m.proxyGate.mu.Lock()
+	defer m.proxyGate.mu.Unlock()
+	if !m.proxyGate.set || time.Since(m.proxyGate.at) >= m.proxyGateTTL {
+		return false, nil
+	}
+	return true, m.proxyGate.err
+}
+
+func (m *SessionManager) storeProxyGate(err error) {
+	m.proxyGate.mu.Lock()
+	defer m.proxyGate.mu.Unlock()
+	m.proxyGate.set = true
+	m.proxyGate.at = time.Now()
+	m.proxyGate.err = err
+}
+
+func proxyGateCacheable(err error) bool {
+	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
+}
+
+func (m *SessionManager) lookupProxyReady(ctx context.Context) error {
+	selector := labels.Set{discoveryv1.LabelServiceName: m.config.ProxyService}.AsSelector().String()
+	sliceList, err := m.clientset.DiscoveryV1().EndpointSlices(m.config.Namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: selector,
+	})
+	if err != nil {
+		return fmt.Errorf("list proxy endpoint slices: %w", err)
+	}
+	if !EndpointSlicesReady(sliceList.Items) {
+		return fmt.Errorf("proxy service %s has no ready endpoint addresses", m.config.ProxyService)
+	}
+	npName := SandboxNetworkPolicyName(m.config.InstanceName)
+	np, err := m.clientset.NetworkingV1().NetworkPolicies(m.config.Namespace).Get(ctx, npName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get sandbox network policy: %w", err)
+	}
+	if !slices.Contains(np.Spec.PolicyTypes, networkingv1.PolicyTypeEgress) {
+		return fmt.Errorf("sandbox network policy %s does not set Egress", npName)
+	}
+	return nil
+}
+
+// EndpointSlicesReady reports whether any slice has an address that can receive
+// traffic. A nil Ready condition counts as ready, matching EndpointSlice compatibility.
+func EndpointSlicesReady(endpointSlices []discoveryv1.EndpointSlice) bool {
+	for i := range endpointSlices {
+		for _, ep := range endpointSlices[i].Endpoints {
+			if len(ep.Addresses) == 0 {
+				continue
+			}
+			if ep.Conditions.Ready == nil || *ep.Conditions.Ready {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // GetOrCreatePod resolves or creates a sandbox pod for the session.
 // Lookup order: cache → label-based K8s API discovery → claim unassigned → on-demand create.
 func (m *SessionManager) GetOrCreatePod(ctx context.Context, sessionID string) (podIP string, err error) {
@@ -131,6 +261,10 @@ func (m *SessionManager) GetOrCreatePod(ctx context.Context, sessionID string) (
 	if ip != "" {
 		m.cache.Set(sessionID, ip, podName)
 		return ip, nil
+	}
+
+	if gateErr := m.ensureProxyReady(ctx); gateErr != nil {
+		return "", gateErr
 	}
 
 	claimedIP, claimedPodName, claimErr := m.pool.ClaimPod(ctx, sessionID)

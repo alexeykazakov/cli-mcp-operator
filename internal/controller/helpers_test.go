@@ -13,6 +13,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -209,12 +211,101 @@ func TestMapSecretIgnoresSessionAuth(t *testing.T) {
 	assert.Equal(t, "oc", reqs[0].Name)
 }
 
+func TestCustomSecretNameEnqueues(t *testing.T) {
+	t.Parallel()
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, climcpv1alpha1.AddToScheme(scheme))
+
+	inst := &climcpv1alpha1.CliMcpInstance{
+		ObjectMeta: metav1.ObjectMeta{Name: "oc", Namespace: "ns"},
+		Spec: climcpv1alpha1.CliMcpInstanceSpec{
+			Proxy: climcpv1alpha1.ProxySpec{Targets: []climcpv1alpha1.ProxyTarget{{
+				Type:       climcpv1alpha1.ProxyTargetKubernetes,
+				SecretName: "custom-kube",
+			}}},
+		},
+	}
+	allow := inst.DeepCopy()
+	allow.Name = "allow"
+	allow.Spec.Proxy.Targets = []climcpv1alpha1.ProxyTarget{{
+		Type:    climcpv1alpha1.ProxyTargetAllowlist,
+		Domains: []string{"example.com"},
+	}}
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithIndex(&climcpv1alpha1.CliMcpInstance{}, effectiveKubeconfigIndex, indexEffectiveKubeconfig).
+		WithObjects(inst, allow).Build()
+	r := &CliMcpInstanceReconciler{Client: c}
+
+	reqs := r.mapSecret(t.Context(), &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "custom-kube", Namespace: "ns"}})
+	require.Len(t, reqs, 1)
+	assert.Equal(t, "oc", reqs[0].Name)
+	assert.Empty(t, r.mapSecret(t.Context(), &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: "ns"}}))
+	assert.Empty(t, indexEffectiveKubeconfig(allow))
+}
+
+func TestOverlayHashIgnoresInvestigationSecret(t *testing.T) {
+	t.Parallel()
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, climcpv1alpha1.AddToScheme(scheme))
+
+	inst := &climcpv1alpha1.CliMcpInstance{
+		ObjectMeta: metav1.ObjectMeta{Name: "oc", Namespace: "ns"},
+		Spec: climcpv1alpha1.CliMcpInstanceSpec{
+			Proxy: climcpv1alpha1.ProxySpec{Targets: []climcpv1alpha1.ProxyTarget{{
+				Type: climcpv1alpha1.ProxyTargetKubernetes,
+			}}},
+		},
+	}
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: proxyName("oc"), Namespace: "ns"},
+		Data:       map[string]string{kubeconfigDataKey: "dummy-a"},
+	}
+	ca := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: proxyCASecretName("oc"), Namespace: "ns"},
+		Data:       map[string][]byte{caCertKey: []byte("ca-a")},
+	}
+	admin := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: kubeconfigSecretName("oc"), Namespace: "ns"},
+		Data:       map[string][]byte{kubeconfigDataKey: []byte("token-a")},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(inst, cm, ca, admin).Build()
+	r := &CliMcpInstanceReconciler{Client: c}
+	cfg := r.poolSandboxConfig(inst)
+	assert.Empty(t, cfg.KubeconfigSecret)
+	assert.Equal(t, proxyName("oc"), cfg.DummyKubeconfigConfigMap)
+	assert.Equal(t, proxyName("oc"), cfg.ProxyService)
+	assert.Equal(t, proxyCASecretName("oc"), cfg.ProxyCASecret)
+
+	_, dummy, caBytes, err := r.overlayInputs(t.Context(), inst)
+	require.NoError(t, err)
+	first, err := overlayHash(cfg, dummy, caBytes)
+	require.NoError(t, err)
+
+	admin.Data[kubeconfigDataKey] = []byte("token-b")
+	require.NoError(t, c.Update(t.Context(), admin))
+	_, dummy, caBytes, err = r.overlayInputs(t.Context(), inst)
+	require.NoError(t, err)
+	second, err := overlayHash(cfg, dummy, caBytes)
+	require.NoError(t, err)
+	assert.Equal(t, first, second)
+
+	cm.Data[kubeconfigDataKey] = "dummy-b"
+	require.NoError(t, c.Update(t.Context(), cm))
+	_, dummy, caBytes, err = r.overlayInputs(t.Context(), inst)
+	require.NoError(t, err)
+	third, err := overlayHash(cfg, dummy, caBytes)
+	require.NoError(t, err)
+	assert.NotEqual(t, first, third)
+}
+
 func TestManagerRoleIsCRDOnly(t *testing.T) {
 	t.Parallel()
 	role := loadRoleYAML(t, filepath.Join("..", "..", "config", "rbac", "role.yaml"))
 	forbidden := []string{
 		"pods", "secrets", "services", "serviceaccounts",
-		"deployments", "roles", "rolebindings", "networkpolicies", "configmaps",
+		"deployments", "roles", "rolebindings", "networkpolicies", "configmaps", "endpoints", "endpointslices",
 	}
 	var crbVerbs, clusterRoleVerbs []string
 	var crbNames, clusterRoleNames []string
@@ -280,17 +371,24 @@ func TestNamespacedRoleHasChildResources(t *testing.T) {
 	}
 	for _, want := range []string{
 		"pods", "secrets", "services", "serviceaccounts", "configmaps",
-		"deployments", "roles", "rolebindings", "networkpolicies",
+		"deployments", "roles", "rolebindings", "networkpolicies", "endpointslices",
 	} {
 		assert.Contains(t, resources, want)
+	}
+	for _, rule := range role.Rules {
+		if slices.Contains(rule.Resources, "endpointslices") {
+			assert.Equal(t, []string{"discovery.k8s.io"}, rule.APIGroups)
+			assert.Equal(t, []string{"list"}, rule.Verbs)
+			assert.Empty(t, rule.ResourceNames)
+		}
 	}
 }
 
 func TestMCPRoleSecretVerbs(t *testing.T) {
 	t.Parallel()
 	var secretRule *rbacv1.PolicyRule
-	for i := range mcpRoleRules() {
-		rule := mcpRoleRules()[i]
+	for i := range mcpRoleRules("oc") {
+		rule := mcpRoleRules("oc")[i]
 		if len(rule.Resources) == 1 && rule.Resources[0] == "secrets" {
 			secretRule = &rule
 		}
@@ -300,6 +398,23 @@ func TestMCPRoleSecretVerbs(t *testing.T) {
 	assert.NotContains(t, secretRule.Verbs, "get")
 	assert.NotContains(t, secretRule.Verbs, "list")
 	assert.NotContains(t, secretRule.Verbs, "watch")
+	var endpointSlices, policies *rbacv1.PolicyRule
+	for i := range mcpRoleRules("oc") {
+		rule := mcpRoleRules("oc")[i]
+		if len(rule.Resources) == 1 && rule.Resources[0] == "endpointslices" {
+			endpointSlices = &rule
+		}
+		if len(rule.Resources) == 1 && rule.Resources[0] == "networkpolicies" {
+			policies = &rule
+		}
+	}
+	require.NotNil(t, endpointSlices)
+	assert.Equal(t, []string{"discovery.k8s.io"}, endpointSlices.APIGroups)
+	assert.Equal(t, []string{"list"}, endpointSlices.Verbs)
+	assert.Empty(t, endpointSlices.ResourceNames)
+	require.NotNil(t, policies)
+	assert.Equal(t, []string{"get"}, policies.Verbs)
+	assert.Equal(t, []string{sandboxSAName("oc")}, policies.ResourceNames)
 }
 
 func TestClientRoleRules(t *testing.T) {
@@ -333,8 +448,19 @@ func TestMCPServerArgsOmitPoolAndIdle(t *testing.T) {
 	assert.NotContains(t, args, "--warm-pool-size")
 	assert.NotContains(t, args, "--idle-timeout")
 	assert.Contains(t, args, "--instance-name")
-	assert.Contains(t, args, "--kubeconfig-secret")
+	assert.Contains(t, args, "--proxy-service")
+	assert.Contains(t, args, "--proxy-ca-secret")
+	assert.NotContains(t, args, "--kubeconfig-secret")
+	assert.NotContains(t, args, "--dummy-kubeconfig-configmap")
 	assert.Contains(t, args, "--sandbox-service-account")
+
+	kube := inst.DeepCopy()
+	kube.Spec.Proxy = kubernetesProxySpec()
+	args, err = mcpServerArgs(kube, sandboxOverlay(climcpv1alpha1.SandboxSpec{}, "sandbox:tag"))
+	require.NoError(t, err)
+	assert.Contains(t, args, "--dummy-kubeconfig-configmap")
+	assert.Contains(t, args, proxyName("oc"))
+	assert.NotContains(t, args, "--kubeconfig-secret")
 }
 
 func loadRoleYAML(t testing.TB, path string) rbacv1.Role {
@@ -356,33 +482,33 @@ func TestOverlayHash(t *testing.T) {
 		MemoryLimit:     "512Mi",
 		ImagePullPolicy: corev1.PullIfNotPresent,
 	}
-	same, err := overlayHash(base)
+	same, err := overlayHash(base, nil, nil)
 	require.NoError(t, err)
-	again, err := overlayHash(base)
+	again, err := overlayHash(base, nil, nil)
 	require.NoError(t, err)
 	assert.Equal(t, same, again)
 
 	otherImg := base
 	otherImg.Image = "img:b"
-	hImg, err := overlayHash(otherImg)
+	hImg, err := overlayHash(otherImg, nil, nil)
 	require.NoError(t, err)
 	assert.NotEqual(t, same, hImg)
 
 	otherEnv := base
 	otherEnv.Env = []corev1.EnvVar{{Name: "FOO", Value: "bar"}}
-	hEnv, err := overlayHash(otherEnv)
+	hEnv, err := overlayHash(otherEnv, nil, nil)
 	require.NoError(t, err)
 	assert.NotEqual(t, same, hEnv)
 
 	otherCPU := base
 	otherCPU.CPURequest = "200m"
-	hCPU, err := overlayHash(otherCPU)
+	hCPU, err := overlayHash(otherCPU, nil, nil)
 	require.NoError(t, err)
 	assert.NotEqual(t, same, hCPU)
 
 	otherPull := base
 	otherPull.ImagePullPolicy = corev1.PullAlways
-	hPull, err := overlayHash(otherPull)
+	hPull, err := overlayHash(otherPull, nil, nil)
 	require.NoError(t, err)
 	assert.NotEqual(t, same, hPull)
 }
@@ -532,6 +658,15 @@ func TestPoolRequeueAfter(t *testing.T) {
 		assert.Equal(t, time.Duration(0), poolRequeueAfter(inst, unhealthy, now))
 	})
 
+	t.Run("retries soon when the proxy gate is closed and a pool is desired", func(t *testing.T) {
+		t.Parallel()
+		now := time.Date(2025, 1, 1, 12, 1, 0, 0, time.UTC)
+		closed := poolSnapshot{desired: 1, proxyGateClosed: true}
+		assert.Equal(t, proxyGateRetry, poolRequeueAfter(&climcpv1alpha1.CliMcpInstance{}, closed, now))
+		full := poolSnapshot{desired: 1, ready: 1, proxyGateClosed: true}
+		assert.Equal(t, proxyGateRetry, poolRequeueAfter(base(), full, now))
+	})
+
 	t.Run("returns 0 when instance is not Ready yet", func(t *testing.T) {
 		t.Parallel()
 		inst := &climcpv1alpha1.CliMcpInstance{
@@ -566,6 +701,7 @@ func TestDeleteUnassignedIfStillUnassigned(t *testing.T) {
 	t.Parallel()
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, networkingv1.AddToScheme(scheme))
 
 	t.Run("skips when session-id appeared", func(t *testing.T) {
 		t.Parallel()
@@ -609,10 +745,106 @@ func TestDeleteUnassignedIfStillUnassigned(t *testing.T) {
 	})
 }
 
+func TestReconcilePoolLeavesPodsWhenProxyGateIsClosed(t *testing.T) {
+	t.Parallel()
+
+	t.Run("missing dummy kubeconfig", func(t *testing.T) {
+		t.Parallel()
+		scheme := poolGateScheme(t)
+		inst := poolInstance()
+		inst.Spec.Proxy = kubernetesProxySpec()
+		stale := sandboxPod("stale", "", time.Now(), time.Now())
+		stale.Annotations[sandboxOverlayAnnotation] = "old"
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append(
+			[]client.Object{inst.DeepCopy(), stale.DeepCopy()},
+			poolGateObjects()...,
+		)...).Build()
+		r := &CliMcpInstanceReconciler{Client: c, Scheme: scheme}
+
+		snap, err := r.reconcilePool(t.Context(), inst, true)
+		require.NoError(t, err)
+		assert.False(t, snap.overlayRebuild)
+		assert.True(t, snap.proxyGateClosed)
+		require.NoError(t, c.Get(t.Context(), types.NamespacedName{Name: "stale", Namespace: "ns"}, &corev1.Pod{}))
+	})
+
+	t.Run("sandbox network policy without egress", func(t *testing.T) {
+		t.Parallel()
+		scheme := poolGateScheme(t)
+		inst := poolInstance()
+		objs := poolGateObjects()
+		for _, obj := range objs {
+			np, ok := obj.(*networkingv1.NetworkPolicy)
+			if ok && np.Name == sandboxSAName("oc") {
+				np.Spec.PolicyTypes = []networkingv1.PolicyType{networkingv1.PolicyTypeIngress}
+			}
+		}
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{inst.DeepCopy()}, objs...)...).Build()
+		r := &CliMcpInstanceReconciler{Client: c, Scheme: scheme}
+
+		snap, err := r.reconcilePool(t.Context(), inst, true)
+		require.NoError(t, err)
+		assert.True(t, snap.proxyGateClosed)
+		var pods corev1.PodList
+		require.NoError(t, c.List(t.Context(), &pods, client.InNamespace("ns"), client.MatchingLabels(sandboxLabels("oc"))))
+		assert.Empty(t, pods.Items)
+	})
+
+	t.Run("zero warm pool deletes unassigned pods without proxy objects", func(t *testing.T) {
+		t.Parallel()
+		scheme := runtime.NewScheme()
+		require.NoError(t, corev1.AddToScheme(scheme))
+		inst := poolInstance()
+		inst.Spec.Sandbox.WarmPoolSize = 0
+		inst.Spec.Proxy = kubernetesProxySpec()
+		stale := sandboxPod("stale", "", time.Now().Add(-time.Minute), time.Now())
+		stale.Annotations[sandboxOverlayAnnotation] = "old"
+		assigned := sandboxPod("assigned", "sess", time.Now(), time.Now())
+		terminating := sandboxPod("dying", "", time.Now(), time.Now())
+		ts := metav1.Now()
+		terminating.DeletionTimestamp = &ts
+		terminating.Finalizers = []string{"cli-mcp.redhat.com/test"}
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+			stale.DeepCopy(), assigned.DeepCopy(), terminating.DeepCopy(),
+		).Build()
+		r := &CliMcpInstanceReconciler{Client: c, Scheme: scheme}
+
+		snap, err := r.reconcilePool(t.Context(), inst, true)
+		require.NoError(t, err)
+		assert.Equal(t, int32(0), snap.desired)
+		assert.False(t, snap.proxyGateClosed)
+		assert.False(t, snap.overlayRebuild)
+		assert.True(t, apierrors.IsNotFound(c.Get(t.Context(), types.NamespacedName{Name: "stale", Namespace: "ns"}, &corev1.Pod{})))
+		require.NoError(t, c.Get(t.Context(), types.NamespacedName{Name: "assigned", Namespace: "ns"}, &corev1.Pod{}))
+		require.NoError(t, c.Get(t.Context(), types.NamespacedName{Name: "dying", Namespace: "ns"}, &corev1.Pod{}))
+	})
+}
+
+func poolGateScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, networkingv1.AddToScheme(scheme))
+	require.NoError(t, discoveryv1.AddToScheme(scheme))
+	require.NoError(t, climcpv1alpha1.AddToScheme(scheme))
+	return scheme
+}
+
+func poolInstance() *climcpv1alpha1.CliMcpInstance {
+	return &climcpv1alpha1.CliMcpInstance{
+		ObjectMeta: metav1.ObjectMeta{Name: "oc", Namespace: "ns"},
+		Spec: climcpv1alpha1.CliMcpInstanceSpec{
+			Sandbox: climcpv1alpha1.SandboxSpec{WarmPoolSize: 1, Image: "img:test"},
+		},
+	}
+}
+
 func TestReconcilePoolErrorKeepsDesired(t *testing.T) {
 	t.Parallel()
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, networkingv1.AddToScheme(scheme))
+	require.NoError(t, discoveryv1.AddToScheme(scheme))
 	require.NoError(t, climcpv1alpha1.AddToScheme(scheme))
 
 	inst := &climcpv1alpha1.CliMcpInstance{
@@ -621,7 +853,7 @@ func TestReconcilePoolErrorKeepsDesired(t *testing.T) {
 			Sandbox: climcpv1alpha1.SandboxSpec{WarmPoolSize: 2, Image: "img:test"},
 		},
 	}
-	inner := fake.NewClientBuilder().WithScheme(scheme).WithObjects(inst.DeepCopy()).Build()
+	inner := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{inst.DeepCopy()}, poolGateObjects()...)...).Build()
 	c := interceptor.NewClient(inner, interceptor.Funcs{
 		Create: func(_ context.Context, _ client.WithWatch, _ client.Object, _ ...client.CreateOption) error {
 			return fmt.Errorf("create failed")
@@ -637,6 +869,8 @@ func TestReconcilePoolRelistsAfterPartialMutate(t *testing.T) {
 	t.Parallel()
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, networkingv1.AddToScheme(scheme))
+	require.NoError(t, discoveryv1.AddToScheme(scheme))
 	require.NoError(t, climcpv1alpha1.AddToScheme(scheme))
 
 	inst := &climcpv1alpha1.CliMcpInstance{
@@ -645,7 +879,7 @@ func TestReconcilePoolRelistsAfterPartialMutate(t *testing.T) {
 			Sandbox: climcpv1alpha1.SandboxSpec{WarmPoolSize: 1, Image: "img:test"},
 		},
 	}
-	hash, err := overlayHash((&CliMcpInstanceReconciler{}).poolSandboxConfig(inst))
+	hash, err := overlayHash((&CliMcpInstanceReconciler{}).poolSandboxConfig(inst), nil, nil)
 	require.NoError(t, err)
 
 	now := time.Now()
@@ -653,7 +887,7 @@ func TestReconcilePoolRelistsAfterPartialMutate(t *testing.T) {
 	p2 := readyPoolPod("mid", now.Add(-time.Minute), hash)
 	p3 := readyPoolPod("new", now, hash)
 
-	inner := fake.NewClientBuilder().WithScheme(scheme).WithObjects(inst.DeepCopy(), &p1, &p2, &p3).Build()
+	inner := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{inst.DeepCopy(), &p1, &p2, &p3}, poolGateObjects()...)...).Build()
 	deletes := 0
 	c := interceptor.NewClient(inner, interceptor.Funcs{
 		Delete: func(ctx context.Context, inner client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
@@ -675,6 +909,8 @@ func TestReconcilePoolTerminatingOccupiesSlot(t *testing.T) {
 	t.Parallel()
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, networkingv1.AddToScheme(scheme))
+	require.NoError(t, discoveryv1.AddToScheme(scheme))
 	require.NoError(t, climcpv1alpha1.AddToScheme(scheme))
 
 	inst := &climcpv1alpha1.CliMcpInstance{
@@ -683,7 +919,7 @@ func TestReconcilePoolTerminatingOccupiesSlot(t *testing.T) {
 			Sandbox: climcpv1alpha1.SandboxSpec{WarmPoolSize: 1, Image: "img:test"},
 		},
 	}
-	hash, err := overlayHash((&CliMcpInstanceReconciler{}).poolSandboxConfig(inst))
+	hash, err := overlayHash((&CliMcpInstanceReconciler{}).poolSandboxConfig(inst), nil, nil)
 	require.NoError(t, err)
 
 	terminating := sandboxPod("dying", "", time.Now(), time.Now())
@@ -692,7 +928,7 @@ func TestReconcilePoolTerminatingOccupiesSlot(t *testing.T) {
 	terminating.DeletionTimestamp = &ts
 	terminating.Finalizers = []string{"cli-mcp.redhat.com/test"}
 
-	inner := fake.NewClientBuilder().WithScheme(scheme).WithObjects(inst.DeepCopy(), terminating.DeepCopy()).Build()
+	inner := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{inst.DeepCopy(), terminating.DeepCopy()}, poolGateObjects()...)...).Build()
 	c := interceptor.NewClient(inner, interceptor.Funcs{
 		Create: func(_ context.Context, _ client.WithWatch, _ client.Object, _ ...client.CreateOption) error {
 			t.Fatal("must not create a replacement while a terminating unassigned pod occupies a slot")
@@ -710,6 +946,8 @@ func TestReconcilePoolStaleDeleteDoesNotCreateWhileTerminating(t *testing.T) {
 	t.Parallel()
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, networkingv1.AddToScheme(scheme))
+	require.NoError(t, discoveryv1.AddToScheme(scheme))
 	require.NoError(t, climcpv1alpha1.AddToScheme(scheme))
 
 	inst := &climcpv1alpha1.CliMcpInstance{
@@ -721,7 +959,7 @@ func TestReconcilePoolStaleDeleteDoesNotCreateWhileTerminating(t *testing.T) {
 	stale := sandboxPod("stale", "", time.Now(), time.Now())
 	stale.Annotations[sandboxOverlayAnnotation] = "not-the-current-hash"
 
-	inner := fake.NewClientBuilder().WithScheme(scheme).WithObjects(inst.DeepCopy(), stale.DeepCopy()).Build()
+	inner := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{inst.DeepCopy(), stale.DeepCopy()}, poolGateObjects()...)...).Build()
 	c := interceptor.NewClient(inner, interceptor.Funcs{
 		Delete: func(_ context.Context, _ client.WithWatch, _ client.Object, _ ...client.DeleteOption) error {
 			return nil
@@ -742,6 +980,8 @@ func TestReconcilePoolReplacesStaleWhenDeleteSucceeds(t *testing.T) {
 	t.Parallel()
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, networkingv1.AddToScheme(scheme))
+	require.NoError(t, discoveryv1.AddToScheme(scheme))
 	require.NoError(t, climcpv1alpha1.AddToScheme(scheme))
 
 	inst := &climcpv1alpha1.CliMcpInstance{
@@ -750,13 +990,13 @@ func TestReconcilePoolReplacesStaleWhenDeleteSucceeds(t *testing.T) {
 			Sandbox: climcpv1alpha1.SandboxSpec{WarmPoolSize: 1, Image: "img:test"},
 		},
 	}
-	hash, err := overlayHash((&CliMcpInstanceReconciler{}).poolSandboxConfig(inst))
+	hash, err := overlayHash((&CliMcpInstanceReconciler{}).poolSandboxConfig(inst), nil, nil)
 	require.NoError(t, err)
 
 	stale := sandboxPod("stale", "", time.Now(), time.Now())
 	stale.Annotations[sandboxOverlayAnnotation] = "not-the-current-hash"
 
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(inst.DeepCopy(), stale.DeepCopy()).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{inst.DeepCopy(), stale.DeepCopy()}, poolGateObjects()...)...).Build()
 	r := &CliMcpInstanceReconciler{Client: c, Scheme: scheme}
 	snap, recErr := r.reconcilePool(t.Context(), inst, true)
 	require.NoError(t, recErr)
@@ -774,6 +1014,8 @@ func TestReconcilePoolAssignedDoesNotOccupySlot(t *testing.T) {
 	t.Parallel()
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, networkingv1.AddToScheme(scheme))
+	require.NoError(t, discoveryv1.AddToScheme(scheme))
 	require.NoError(t, climcpv1alpha1.AddToScheme(scheme))
 
 	inst := &climcpv1alpha1.CliMcpInstance{
@@ -783,7 +1025,7 @@ func TestReconcilePoolAssignedDoesNotOccupySlot(t *testing.T) {
 		},
 	}
 	assigned := sandboxPod("kept-session", "sess", time.Now(), time.Now())
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(inst.DeepCopy(), assigned.DeepCopy()).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{inst.DeepCopy(), assigned.DeepCopy()}, poolGateObjects()...)...).Build()
 	r := &CliMcpInstanceReconciler{Client: c, Scheme: scheme}
 	snap, recErr := r.reconcilePool(t.Context(), inst, true)
 	require.NoError(t, recErr)
@@ -820,6 +1062,42 @@ func sandboxPod(name, sessionID string, created, activity time.Time) corev1.Pod 
 				session.AnnotationLastActivity: activity.UTC().Format(time.RFC3339),
 			},
 		},
+	}
+}
+
+func poolGateObjects() []client.Object {
+	ready := true
+	return []client.Object{
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: proxyName("oc"), Namespace: "ns"},
+			Data:       map[string]string{proxyConfigDataKey: `{"routes":[]}`},
+		},
+		&networkingv1.NetworkPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: sandboxSAName("oc"), Namespace: "ns"},
+			Spec: networkingv1.NetworkPolicySpec{
+				PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
+			},
+		},
+		&networkingv1.NetworkPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: proxyName("oc"), Namespace: "ns"},
+		},
+		proxyEndpointSlice("ns", proxyName("oc"), proxyName("oc"), "10.0.0.8", &ready),
+	}
+}
+
+func proxyEndpointSlice(namespace, name, service, ip string, ready *bool) *discoveryv1.EndpointSlice {
+	ep := discoveryv1.Endpoint{Conditions: discoveryv1.EndpointConditions{Ready: ready}}
+	if ip != "" {
+		ep.Addresses = []string{ip}
+	}
+	return &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels:    map[string]string{discoveryv1.LabelServiceName: service},
+		},
+		AddressType: discoveryv1.AddressTypeIPv4,
+		Endpoints:   []discoveryv1.Endpoint{ep},
 	}
 }
 

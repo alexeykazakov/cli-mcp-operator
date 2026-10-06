@@ -11,6 +11,8 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +20,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -233,6 +237,29 @@ func TestNewSessionManagerValidation(t *testing.T) {
 
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "KubeconfigSecret")
+	})
+
+	t.Run("proxy mode rejects KubeconfigSecret", func(t *testing.T) {
+		cfg := newTestConfig()
+		cfg.ProxyService = "cli-mcp-oc-proxy"
+		cfg.ProxyCASecret = "cli-mcp-oc-proxy-ca"
+
+		_, err := NewSessionManager(client, cfg, slog.Default())
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "KubeconfigSecret")
+	})
+
+	t.Run("proxy mode does not require KubeconfigSecret", func(t *testing.T) {
+		cfg := newTestConfig()
+		cfg.KubeconfigSecret = ""
+		cfg.ProxyService = "cli-mcp-oc-proxy"
+		cfg.ProxyCASecret = "cli-mcp-oc-proxy-ca"
+
+		mgr, err := NewSessionManager(client, cfg, slog.Default())
+
+		require.NoError(t, err)
+		assert.NotNil(t, mgr)
 	})
 
 	t.Run("accepts valid config", func(t *testing.T) {
@@ -868,4 +895,224 @@ func TestExecuteCommand(t *testing.T) {
 			return updated.Annotations[AnnotationLastActivity] != oldActivity
 		}, time.Second, 10*time.Millisecond, "last-activity should be patched using pre-Execute podName")
 	})
+}
+
+func proxySandboxConfig() SandboxConfig {
+	cfg := newTestConfig()
+	cfg.KubeconfigSecret = ""
+	cfg.ProxyService = "cli-mcp-oc-proxy"
+	cfg.ProxyCASecret = "cli-mcp-oc-proxy-ca"
+	return cfg
+}
+
+func seedProxyGate(t *testing.T, client kubernetes.Interface, ready bool) {
+	t.Helper()
+	_, err := client.DiscoveryV1().EndpointSlices(testNamespace).Create(t.Context(), proxySlice(testNamespace, "cli-mcp-oc-proxy", "cli-mcp-oc-proxy", ready), metav1.CreateOptions{})
+	require.NoError(t, err)
+	_, err = client.NetworkingV1().NetworkPolicies(testNamespace).Create(t.Context(), &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: SandboxNetworkPolicyName(testInstance), Namespace: testNamespace},
+		Spec: networkingv1.NetworkPolicySpec{
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
+		},
+	}, metav1.CreateOptions{})
+	require.NoError(t, err)
+}
+
+func openProxyGate(t *testing.T, client kubernetes.Interface) {
+	t.Helper()
+	np, err := client.NetworkingV1().NetworkPolicies(testNamespace).Get(t.Context(), SandboxNetworkPolicyName(testInstance), metav1.GetOptions{})
+	require.NoError(t, err)
+	np.Spec.PolicyTypes = []networkingv1.PolicyType{networkingv1.PolicyTypeEgress}
+	_, err = client.NetworkingV1().NetworkPolicies(testNamespace).Update(t.Context(), np, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	ep, err := client.DiscoveryV1().EndpointSlices(testNamespace).Get(t.Context(), "cli-mcp-oc-proxy", metav1.GetOptions{})
+	require.NoError(t, err)
+	ready := true
+	ep.Endpoints[0].Conditions.Ready = &ready
+	_, err = client.DiscoveryV1().EndpointSlices(testNamespace).Update(t.Context(), ep, metav1.UpdateOptions{})
+	require.NoError(t, err)
+}
+
+func proxySlice(namespace, name, service string, ready bool) *discoveryv1.EndpointSlice {
+	readyVal := ready
+	return &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels:    map[string]string{discoveryv1.LabelServiceName: service},
+		},
+		AddressType: discoveryv1.AddressTypeIPv4,
+		Endpoints: []discoveryv1.Endpoint{{
+			Addresses:  []string{"10.9.9.9"},
+			Conditions: discoveryv1.EndpointConditions{Ready: &readyVal},
+		}},
+	}
+}
+
+func TestProxyGate(t *testing.T) {
+	t.Run("blocks claim until endpoints and egress are ready", func(t *testing.T) {
+		pool := readyPod("ignored", "10.0.0.4", time.Now())
+		pool.Name = "pool-1"
+		delete(pool.Labels, LabelSessionID)
+		client := fake.NewSimpleClientset(&pool)
+		seedProxyGate(t, client, false)
+		mgr, err := NewSessionManager(client, proxySandboxConfig(), slog.Default())
+		require.NoError(t, err)
+
+		_, err = mgr.GetOrCreatePod(t.Context(), "inv-claim")
+		require.Error(t, err)
+		got, err := client.CoreV1().Pods(testNamespace).Get(t.Context(), "pool-1", metav1.GetOptions{})
+		require.NoError(t, err)
+		assert.Empty(t, got.Labels[LabelSessionID])
+	})
+
+	t.Run("blocks create until endpoints and egress are ready", func(t *testing.T) {
+		client := fake.NewSimpleClientset()
+		seedProxyGate(t, client, false)
+		mgr, err := NewSessionManager(client, proxySandboxConfig(), slog.Default())
+		require.NoError(t, err)
+
+		_, err = mgr.GetOrCreatePod(t.Context(), "inv-create")
+		require.Error(t, err)
+		pods, listErr := client.CoreV1().Pods(testNamespace).List(t.Context(), metav1.ListOptions{})
+		require.NoError(t, listErr)
+		assert.Empty(t, pods.Items)
+
+		openProxyGate(t, client)
+		_, err = mgr.GetOrCreatePod(t.Context(), "inv-create")
+		require.Error(t, err)
+		pods, listErr = client.CoreV1().Pods(testNamespace).List(t.Context(), metav1.ListOptions{})
+		require.NoError(t, listErr)
+		assert.Empty(t, pods.Items)
+
+		mgr.proxyGateTTL = 0
+		done := make(chan error, 1)
+		go func() { done <- markPodReady(mgr, "inv-create", "10.0.0.99") }()
+		ip, err := mgr.GetOrCreatePod(t.Context(), "inv-create")
+		require.NoError(t, <-done)
+		require.NoError(t, err)
+		assert.Equal(t, "10.0.0.99", ip)
+	})
+
+	t.Run("does not block an already assigned pod", func(t *testing.T) {
+		pod := readyPod("inv-kept", "10.0.0.3", time.Now())
+		client := fake.NewSimpleClientset(&pod)
+		mgr, err := NewSessionManager(client, proxySandboxConfig(), slog.Default())
+		require.NoError(t, err)
+
+		ip, err := mgr.GetOrCreatePod(t.Context(), "inv-kept")
+		require.NoError(t, err)
+		assert.Equal(t, "10.0.0.3", ip)
+	})
+}
+
+func TestEnsureProxyReadyDoesNotCacheContextErrors(t *testing.T) {
+	t.Parallel()
+	for _, lookupErr := range []error{context.Canceled, context.DeadlineExceeded} {
+		t.Run(lookupErr.Error(), func(t *testing.T) {
+			t.Parallel()
+			client := fake.NewSimpleClientset()
+			seedProxyGate(t, client, true)
+			openProxyGate(t, client)
+			var once sync.Once
+			client.PrependReactor("list", "endpointslices", func(k8stesting.Action) (bool, runtime.Object, error) {
+				fail := false
+				once.Do(func() { fail = true })
+				if fail {
+					return true, nil, lookupErr
+				}
+				return false, nil, nil
+			})
+			mgr, err := NewSessionManager(client, proxySandboxConfig(), slog.Default())
+			require.NoError(t, err)
+
+			err = mgr.ensureProxyReady(t.Context())
+			require.ErrorIs(t, err, lookupErr)
+			require.NoError(t, mgr.ensureProxyReady(t.Context()))
+		})
+	}
+}
+
+func TestEnsureProxyReadyDoesNotHoldLockDuringLookup(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	seedProxyGate(t, client, true)
+	openProxyGate(t, client)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	var gets atomic.Int32
+	client.PrependReactor("list", "endpointslices", func(k8stesting.Action) (bool, runtime.Object, error) {
+		gets.Add(1)
+		once.Do(func() { close(started) })
+		<-release
+		return false, nil, nil
+	})
+	mgr, err := NewSessionManager(client, proxySandboxConfig(), slog.Default())
+	require.NoError(t, err)
+
+	leaderErr := make(chan error, 1)
+	go func() { leaderErr <- mgr.ensureProxyReady(context.Background()) }()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("lookup did not start")
+	}
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	followerErr := make(chan error, 1)
+	go func() { followerErr <- mgr.ensureProxyReady(canceled) }()
+	select {
+	case err := <-followerErr:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("canceled caller blocked behind in-flight lookup")
+	}
+
+	close(release)
+	require.NoError(t, <-leaderErr)
+	require.NoError(t, mgr.ensureProxyReady(context.Background()))
+	assert.Equal(t, int32(1), gets.Load())
+}
+
+func TestEndpointSlicesReady(t *testing.T) {
+	t.Parallel()
+	ready := true
+	notReady := false
+	slice := func(ip string, ready *bool) discoveryv1.EndpointSlice {
+		ep := discoveryv1.Endpoint{Conditions: discoveryv1.EndpointConditions{Ready: ready}}
+		if ip != "" {
+			ep.Addresses = []string{ip}
+		}
+		return discoveryv1.EndpointSlice{Endpoints: []discoveryv1.Endpoint{ep}}
+	}
+	assert.False(t, EndpointSlicesReady(nil))
+	assert.False(t, EndpointSlicesReady([]discoveryv1.EndpointSlice{slice("10.0.0.1", &notReady)}))
+	assert.False(t, EndpointSlicesReady([]discoveryv1.EndpointSlice{slice("", &ready)}))
+	assert.True(t, EndpointSlicesReady([]discoveryv1.EndpointSlice{slice("10.0.0.1", nil)}))
+	assert.True(t, EndpointSlicesReady([]discoveryv1.EndpointSlice{
+		slice("10.0.0.1", &notReady),
+		slice("10.0.0.2", &ready),
+	}))
+}
+
+func TestLookupProxyReadyIgnoresOtherServices(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	seedProxyGate(t, client, false)
+	_, err := client.DiscoveryV1().EndpointSlices(testNamespace).Create(
+		t.Context(), proxySlice(testNamespace, "other-svc", "other-svc", true), metav1.CreateOptions{},
+	)
+	require.NoError(t, err)
+	np, err := client.NetworkingV1().NetworkPolicies(testNamespace).Get(t.Context(), SandboxNetworkPolicyName(testInstance), metav1.GetOptions{})
+	require.NoError(t, err)
+	np.Spec.PolicyTypes = []networkingv1.PolicyType{networkingv1.PolicyTypeEgress}
+	_, err = client.NetworkingV1().NetworkPolicies(testNamespace).Update(t.Context(), np, metav1.UpdateOptions{})
+	require.NoError(t, err)
+
+	mgr, err := NewSessionManager(client, proxySandboxConfig(), slog.Default())
+	require.NoError(t, err)
+	err = mgr.ensureProxyReady(t.Context())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no ready endpoint addresses")
 }
